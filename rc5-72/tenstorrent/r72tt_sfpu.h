@@ -58,6 +58,10 @@
 #define SFPXOR(c, d)              SFPOP(0x8D, 0, c, d, 0)
 #define SFPMOVNEG(c, d)           SFPOP(0x7C, 0, c, d, 1)   /* VD = VC ^ 2^31 */
 #define SFPCONFIG(d)              TT_OP(0x91, ((d) << 4))
+#define SFPNOP                    TT_OP(0x8F, 0)
+/* The low 16 bits of LaneConfig = bits. They are all zero otherwise. */
+#define SFPCONFIG_LANE(bits)      TT_OP(0x91, ((uint32_t)(bits) << 8) + (15 << 4) + 1)
+#define LANECONFIG_DEST_WR_COL_EXCHANGE 0x80   /* SFPSTORE writes the odd columns */
 #define SFPSHFT2(imm12, c, d, mod) SFPOP(0x94, imm12, c, d, mod)
 #define STALLWAIT(block, cond)    TT_OP(0xA2, ((block) << 15) + (cond))
 #define SETDMAREG(value, reg16)   TT_OP(0x45, ((value) << 8) + (reg16))
@@ -118,8 +122,9 @@
 #define TENSIX_GPR63      (0xFFE00000u + 63 * 4)
 #define TENSIX_GPR63_LO16 126
 #define DST_BASE          0xFFBD8000u
-#define DST_SLOT_LANE(slot_addr, lane) \
-  (DST_BASE + ((((slot_addr) + (lane) / 8) * 16 + 2 * ((lane) & 7)) * 4))
+/* A slot's value for a lane: in the even columns, or the odd ones */
+#define DST_SLOT_LANE(slot_addr, lane, odd) \
+  (DST_BASE + ((((slot_addr) + (lane) / 8) * 16 + 2 * ((lane) & 7) + (odd)) * 4))
 
 /* Pushes a compile-time constant instruction as a single .ttinsn */
 #define TTI_ROT2(w) ((((uint32_t)(w)) << 2) | (((uint32_t)(w)) >> 30))
@@ -261,6 +266,9 @@ static void sfpu_setup(uint32_t plain_lo, uint32_t plain_hi, uint32_t cypher_lo)
 {
   uint32_t i;
 
+  /* sfpu_lm_setup() may have left stores going to the odd columns */
+  TTI(SFPCONFIG_LANE(0));
+  TTI(SFPNOP);
   TTI(SETC16(THCFG_ADDR_MOD_AB(AM_KEEP), 0));
   TTI(SETC16(THCFG_ADDR_MOD_DST(AM_KEEP), 0));
   TTI(SETC16(THCFG_ADDR_MOD_BIAS(AM_KEEP), 0));
@@ -305,7 +313,6 @@ static void sfpu_prefix(const prefix_t *p)
   TTI(SFPSTORE(LR_X, SLOT_PAB));
   sfpu_loadi32(LR_X, p->s0);
   TTI(SFPSTORE(LR_X, SLOT_PS(0)));
-  TTI(SFPSTORE(LR_X, SLOT_LM_S0));   /* where sfpu_batch_lm() loads it from */
   sfpu_loadi32(LR_X, p->s1);
   TTI(SFPSTORE(LR_X, SLOT_PS(1)));
   sfpu_loadi32(LR_X, p->s2);
@@ -402,10 +409,14 @@ static void sfpu_batch(uint32_t base, int verify)
 }
 
 /* Stores the OR of the ACC bits of each row of eight lanes to every lane of
-   that row of SLOT_ANY, and waits until it (and ACC) can be read */
-static void sfpu_flush_acc(void)
+   that row of SLOT_ANY, and waits until it (and ACC) can be read. 'odd':
+   ACC is in the odd columns (see r72tt_sfpu_lm.h). */
+static void sfpu_flush_acc(int odd)
 {
-  TTI(SFPLOAD(LR_X, SLOT_ACC));
+  if (odd)
+    TTI(SFPLOAD(LR_X, SLOT_ACC + 2));
+  else
+    TTI(SFPLOAD(LR_X, SLOT_ACC));
   TTI(SFPSHFT2(0, LR_X, LR_Y, SHFT2_ROR1));
   TTI(SFPOR(0, LR_Y, LR_X, LOGIC_VD));
   TTI(SFPSHFT2(0, LR_X, LR_Y, SHFT2_ROR1));

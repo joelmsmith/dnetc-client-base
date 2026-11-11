@@ -16,8 +16,8 @@
 # - the store of S[i] is scheduled, so it takes no cycle of its own;
 # - each SFPLOADMACRO's cycle also runs one add or sign flip scheduled by
 #   the SFPLOADMACRO before it.
-# A key schedule step then takes 11 cycles (12 in the first pass) and an
-# encryption half round 6. See the comments in the generated file.
+# A key schedule step then takes 11 cycles and an encryption half round 6.
+# See the comments in the generated file.
 
 import random
 import sys
@@ -32,32 +32,35 @@ REG_NAME = {0: 'LM_A', 1: 'LM_X0', 2: 'LM_X1', 3: 'LM_G', 4: 'LM_Y', 5: 'LM_L0',
             7: 'LM_L2', 12: 'LR_CLO', 15: 'LR_LANE2'}
 LREG = [L0, L1, L2]
 
-# Dst slots (of four rows). 0..27 hold S[]; the rest as r72tt_sfpu.h.
+# Dst slots (of four rows). A slot has even and odd columns: with
+# DEST_WR_COL_EXCHANGE set every store goes to the odd ones, so the
+# constants in the even ones survive the stores to their slots.
 S_ACC, S_PLO, S_PHI, S_EA = 52, 53, 54, 55
 S_PAB, S_PS0, S_PS1, S_PS2, S_PL0, S_PL1 = 57, 58, 59, 60, 61, 62
-S_C = 64          # P + i*Q for i = 4..25, then S[0] and S[1] of the prefix
-S_C_S0, S_C_S1 = S_C + 22, S_C + 23
+S_C = 64          # even: P + i*Q for i = 4..25; odd, from S_C - 1 on: S[]
+S_S2, S_C_S0, S_C_S1 = S_C - 1, S_C + 22, S_C + 23   # where the prefix's S[2], S[0], S[1] go
 S_INIT3 = 88      # P + 3*Q
 S_DUMMY = 89
 SLOT_NAME = {S_ACC: 'SLOT_ACC', S_PLO: 'SLOT_PLAIN_LO', S_PHI: 'SLOT_PLAIN_HI', S_EA: 'SLOT_EA',
              S_PAB: 'SLOT_PAB', S_PS0: 'SLOT_PS(0)', S_PS1: 'SLOT_PS(1)', S_PS2: 'SLOT_PS(2)',
              S_PL0: 'SLOT_PL(0)', S_PL1: 'SLOT_PL(1)', S_INIT3: 'SLOT_LM_INIT3',
-             S_DUMMY: 'SLOT_LM_DUMMY', S_C_S0: 'SLOT_LM_S0', S_C_S1: 'SLOT_LM_S1'}
+             S_DUMMY: 'SLOT_LM_DUMMY', S_C: 'SLOT_LM_C(4)', S_S2: 'SLOT_LM_S(-1)',
+             S_C + 1: 'SLOT_LM_S(1)', S_C_S0: 'SLOT_LM_S(22)', S_C_S1: 'SLOT_LM_S(23)'}
 
 KEEP, NEXT, CLEAR = 0, 1, 2
 AM_NAME = ['AM_KEEP', 'AM_NEXT', 'AM_CLEAR']
 
 # Macros (sequences) and instruction templates
-MS, MS1, MD, ME = 0, 1, 2, 3
-MACRO_NAME = ['LM_MACRO_S', 'LM_MACRO_S1', 'LM_MACRO_D', 'LM_MACRO_E']
+MS, MD, ME = 0, 1, 2
+MACRO_NAME = ['LM_MACRO_S', 'LM_MACRO_D', 'LM_MACRO_E']
 # template index -> (kind, fixed VC)
 TEMPLATES = [('addm', A), ('negm', A), ('addm', Y)]
 # macro -> (template, simple delay, store delay or None)
-MACROS = {MS: (0, 6, 6), MS1: (0, 6, None), MD: (1, 3, None), ME: (2, 5, None)}
+MACROS = {MS: (0, 6, 6), MD: (1, 3, None), ME: (2, 5, None)}
 
 
-def slot_c(n):
-    return SLOT_NAME.get(n, 'SLOT(%d)' % n)
+def slot_c(n, odd=False):
+    return SLOT_NAME.get(n, 'SLOT(%d)' % n) + (' + LM_ODD' if odd else '')
 
 
 class I:
@@ -107,18 +110,19 @@ def lz(c, d):
     return I('lz', 'SFPLZ(%s, %s)' % (r(c), r(d)), c=c, d=d)
 
 
-def load(d, slot, am=KEEP):
-    return I('load', 'SFPLOAD_AM(%s, %s, %s)' % (r(d), AM_NAME[am], slot_c(slot)), d=d, slot=slot, am=am)
+def load(d, slot, am=KEEP, odd=False):
+    return I('load', 'SFPLOAD_AM(%s, %s, %s)' % (r(d), AM_NAME[am], slot_c(slot, odd)),
+             d=d, slot=slot, am=am, odd=odd)
 
 
-def store(d, slot, am=KEEP, verify=False):
+def store(d, slot, am=KEEP, verify=False):   # to the odd columns
     return I('store', 'SFPSTORE_AM(%s, %s, %s)' % (r(d), AM_NAME[am], slot_c(slot)),
              d=d, slot=slot, am=am, verify=verify)
 
 
-def lm(macro, d, slot, am=KEEP):
-    return I('lm', 'SFPLOADMACRO(%s, %s, %s, %s)' % (MACRO_NAME[macro], r(d), AM_NAME[am], slot_c(slot)),
-             macro=macro, d=d, slot=slot, am=am)
+def lm(macro, d, slot, am=KEEP, odd=False):
+    return I('lm', 'SFPLOADMACRO(%s, %s, %s, %s)' % (MACRO_NAME[macro], r(d), AM_NAME[am], slot_c(slot, odd)),
+             macro=macro, d=d, slot=slot, am=am, odd=odd)
 
 
 UNIT = {'add': 'simple', 'addbase': 'simple', 'shimm': 'simple', 'shft': 'simple', 'or': 'simple',
@@ -136,27 +140,20 @@ def xnext(g):
     return X1 if g % 2 == 0 else X0
 
 
-def step(g, kind, lm_slot, lm_am=NEXT, lm_macro=None):
+def step(g, lm_slot, lm_am=NEXT, odd=True):
     """Key schedule step g (global index: first pass -23..-1, second 0..25,
     third 26..50), updating L[(g + 2) % 3]. Entered with xcur = S[i] + A
     (the add scheduled by the step before) and xnext = S[i + 1] loaded."""
     xc = xcur(g)
     lj, lp = LREG[(g + 2) % 3], LREG[(g + 1) % 3]
-    out = [iadd(lp, xc), shl_imm(3, xc, Y), shl_imm(-29, xc, A), bor(Y, A)]
-    if kind == 1:
-        # the scheduled xnext += A runs with this store
-        out += [store(A, 2, KEEP), iadd(lp, A), iadd(A, lj), shft2(lj, A, Y), neg(A, G),
-                lm(lm_macro if lm_macro is not None else MS1, xc, lm_slot, lm_am),
-                shft(G, lj), bor(Y, lj)]
-    else:
-        # the scheduled xnext += A and store of A run with the dummy load;
-        # its scheduled G = -A runs with the next load
-        out += [lm(MD, G, S_DUMMY, KEEP), iadd(lp, A), iadd(A, lj), shft2(lj, A, Y),
-                lm(MS, xc, lm_slot, lm_am), shft(G, lj), bor(Y, lj)]
-    return out
+    # The scheduled xnext += A and store of A run with the dummy load, whose
+    # scheduled G = -A runs with the next load
+    return [iadd(lp, xc), shl_imm(3, xc, Y), shl_imm(-29, xc, A), bor(Y, A),
+            lm(MD, G, S_DUMMY, KEEP), iadd(lp, A), iadd(A, lj), shft2(lj, A, Y),
+            lm(MS, xc, lm_slot, lm_am, odd), shft(G, lj), bor(Y, lj)]
 
 
-def half(k, slot=4, am=NEXT, last=False):
+def half(k, am=NEXT, last=False):
     """Encryption half round k = 2..24: d = rotl(d ^ o, o) + S[k]. The three
     registers holding d, o and the loaded S[k] rotate: the sum lands in the
     register S[k] was loaded into."""
@@ -164,7 +161,7 @@ def half(k, slot=4, am=NEXT, last=False):
     d, o = regs[(k + 1) % 3], regs[(k + 2) % 3]
     out = [bxor(o, d), shft2(d, o, Y), neg(o, L0), shft(L0, d), bor(d, Y)]
     if not last:
-        out.append(lm(ME, d, slot, am))
+        out.append(lm(ME, d, S_C + 1, am, odd=True))
     return out
 
 
@@ -173,29 +170,31 @@ def build():
     ('loop', count, [I])."""
     seg = []
     # Prologue: L[2] = rotl(hi + ab, ab) with hi = base + lane, the prefix,
-    # and the first two S values
-    # (the SFPLOADMACRO must come six instructions before the first step's
-    # store, and nothing after it may use a fixed Dst address)
-    pro = [shl_imm(-1, LANE2, L2), iadd_base(L2), load(G, S_PAB), iadd(G, L2), shft2(L2, G, Y),
+    # and the prefix's S[0..2] to where the passes load them from. The
+    # SFPLOADMACRO must come six instructions before the first step's dummy
+    # load, and nothing after it may use a fixed Dst address.
+    o = True
+    pro = [shl_imm(-1, LANE2, L2), iadd_base(L2), load(G, S_PAB, odd=o), iadd(G, L2), shft2(L2, G, Y),
            neg(G, G), shft(G, L2),
-           load(A, S_PS2), load(L0, S_PL0), load(L1, S_PL1),
-           load(X0, S_PS1), store(X0, S_C_S1), store(A, 2), load(xcur(-23), S_INIT3),
-           lm(MS1, xnext(-23), S_C, NEXT), iadd(A, xcur(-23)), bor(Y, L2)]
+           load(A, S_PS2, odd=o), load(L0, S_PL0, odd=o), load(L1, S_PL1, odd=o),
+           load(X0, S_PS1, odd=o), store(X0, S_C_S1), load(X0, S_PS0, odd=o), store(X0, S_C_S0),
+           store(A, S_S2), load(xcur(-23), S_INIT3),
+           lm(MS, xnext(-23), S_C, NEXT), iadd(A, xcur(-23)), bor(Y, L2)]
     seg.append(('flat', 'prologue', pro))
-    # First pass: steps 3..25 are g = -23..-1
-    body = sum((step(g, 1, S_C) for g in range(-23, -17)), [])
+    # First pass: steps 3..25 are g = -23..-1. They load P + i*Q from the
+    # even columns, then S[0] and S[1] from the odd columns after them.
+    body = sum((step(g, S_C, odd=False) for g in range(-23, -17)), [])
     seg.append(('loop', 3, 'first pass, steps 3..20', body))
-    tail = sum((step(g, 1, S_C) for g in range(-5, -1)), [])
-    tail += step(-1, 1, S_C, CLEAR, MS)
+    tail = sum((step(g, S_C, odd=False) for g in range(-5, -2)), [])
+    tail += step(-2, S_C) + step(-1, S_C, CLEAR)
     seg.append(('flat', 'first pass, steps 21..25', tail))
     # Second pass, steps 0..23
-    body = sum((step(g, 2, 2) for g in range(0, 6)), [])
+    body = sum((step(g, S_S2) for g in range(0, 6)), [])
     seg.append(('loop', 4, 'second pass, steps 0..23', body))
     # steps 24 and 25 load S[0] and S[1] for the third pass
-    seg.append(('flat', 'second pass, steps 24 and 25',
-                step(24, 2, S_C_S1 - 24, CLEAR) + step(25, 2, 2, KEEP)))
+    seg.append(('flat', 'second pass, steps 24 and 25', step(24, S_S2, CLEAR) + step(25, S_S2, KEEP)))
     # Third pass, steps 0..23
-    body = sum((step(g, 2, 3) for g in range(26, 32)), [])
+    body = sum((step(g, S_C) for g in range(26, 32)), [])
     seg.append(('loop', 4, 'third pass, steps 0..23', body))
     # Step 24: S[24] only. Then eA = plain_lo + S[0], eB = plain_hi + S[1];
     # the first load is where step 23's scheduled instructions run.
@@ -207,9 +206,9 @@ def build():
     assert ea == xc and eb == xnext(g)   # xc is free after its last use; xnext after the scheduled add
     fin = [iadd(lp, xc), shl_imm(3, xc, Y), shl_imm(-29, xc, A), bor(Y, A),
            load(ea, S_PLO - 24, CLEAR),          # RWC is 24 here
-           load(Y, 2), iadd(Y, ea),              # S[0] is in slot 2
-           load(eb, S_PHI), load(Y, 3), iadd(Y, eb),
-           lm(ME, w2, 4, NEXT)]
+           load(Y, S_S2, odd=o), iadd(Y, ea),
+           load(eb, S_PHI), load(Y, S_C, odd=o), iadd(Y, eb),
+           lm(ME, w2, S_C + 1, NEXT, odd=o)]
     seg.append(('flat', 'third pass, step 24, and the start of the encryption', fin))
     # The registers of a half round repeat every three half rounds, so three
     # of them fit the replay buffer. Replaying them leaves TRISC1 well ahead
@@ -226,7 +225,7 @@ def build():
     d24 = regs3[(24 + 1) % 3]
     o24 = regs3[(24 + 2) % 3]
     res = [x for x in regs3 if x not in (d24, o24)][0]
-    cmpseq = [load(L1, S_ACC), store(res, S_EA, verify=True), bxor(CLO, res), lz(res, res),
+    cmpseq = [load(L1, S_ACC, odd=True), store(res, S_EA, verify=True), bxor(CLO, res), lz(res, res),
               shl_imm(-5, res, res), shl_imm(1, L1, L1), bor(res, L1), store(L1, S_ACC)]
     seg.append(('flat', 'compare', cmpseq))
     return seg, res
@@ -300,9 +299,9 @@ class Model:
         if op == 'lz':
             return {ins.c}, {ins.d: [32 - a.bit_length() for a in g(ins.c)]}, None
         if op in ('load', 'lm'):
-            addr = ins.slot + self.rwc
+            addr = (ins.slot + self.rwc, ins.odd)
             if addr not in self.dst:
-                self.errors.append('t=%d: load of unwritten slot %d' % (self.t, addr))
+                self.errors.append('t=%d: load of unwritten slot %s' % (self.t, addr))
                 vals = [0xDEAD0000 + self.t] * self.n
             else:
                 vals = list(self.dst[addr])
@@ -310,7 +309,7 @@ class Model:
         if op == 'store':
             if ins.verify and not verify:
                 return set(), {}, None
-            return {ins.d}, {}, (ins.slot + self.rwc, list(g(ins.d)))
+            return {ins.d}, {}, ((ins.slot + self.rwc, True), list(g(ins.d)))
         raise ValueError(op)
 
     def issue(self, ins, base=0, verify=False):
@@ -356,7 +355,7 @@ class Model:
         if ins.op == 'lm':
             tmpl, sdelay, stdelay = MACROS[ins.macro]
             kind, vc = TEMPLATES[tmpl]
-            addr = ins.slot + self.rwc
+            addr = (ins.slot + self.rwc, True)   # the scheduled store's column
             new = [(self.t + 1 + sdelay, 'simple', kind, (vc, ins.d))]
             if stdelay is not None:
                 new.append((self.t + 1 + stdelay, 'store', 'store', (A, addr)))
@@ -403,34 +402,38 @@ def check(seg, res, batches):
     rnd = random.Random(72)
     lanes = 8
     m = Model(lanes)
+    ev, od = False, True
     for i in range(4, 26):
-        m.dst[S_C + i - 4] = [(P + i * Q) & M32] * lanes
-    m.dst[S_INIT3] = [(P + 3 * Q) & M32] * lanes
+        m.dst[(S_C + i - 4, ev)] = [(P + i * Q) & M32] * lanes
+    m.dst[(S_INIT3, ev)] = [(P + 3 * Q) & M32] * lanes
     for i in range(26):          # the dummy loads move with the RWC; their values are unused
-        m.dst[S_DUMMY + i] = [0x5A5A0000 + i] * lanes
-    m.dst[26] = [0x5A5A5A5A] * lanes   # loaded once before it is first stored to; unused
-    m.dst[S_ACC] = [0] * lanes
+        m.dst[(S_DUMMY + i, ev)] = [0x5A5A0000 + i] * lanes
+    m.dst[(S_ACC, od)] = [0] * lanes
     bad = 0
     for b in range(batches):
         mid, lo, plo, phi = (rnd.getrandbits(32) for _ in range(4))
         base = rnd.randrange(8) * 32
         clo = rc5_lo(base + rnd.randrange(lanes), mid, lo, plo, phi)   # one lane matches
         s0, s1, s2, l0, l1, ab = prefix(mid, lo)
-        for slot, v in ((S_PAB, ab), (S_PS0, s0), (S_PS1, s1), (S_PS2, s2), (S_PL0, l0), (S_PL1, l1),
-                        (S_C_S0, s0), (S_PLO, plo), (S_PHI, phi)):
-            m.dst[slot] = [v] * lanes
+        for slot, v in ((S_PAB, ab), (S_PS0, s0), (S_PS1, s1), (S_PS2, s2), (S_PL0, l0), (S_PL1, l1)):
+            m.dst[(slot, od)] = [v] * lanes
+        m.dst[(S_PLO, ev)] = [plo] * lanes
+        m.dst[(S_PHI, ev)] = [phi] * lanes
         m.reg[CLO] = [clo] * lanes
-        acc_before = list(m.dst[S_ACC])
+        acc_before = list(m.dst[(S_ACC, od)])
         for ins in stream:
             m.issue(ins, base, verify=True)
         want = [rc5_lo(base + i, mid, lo, plo, phi) for i in range(lanes)]
-        if m.dst[S_EA] != want:
+        if m.dst[(S_EA, od)] != want:
             bad += 1
         acc = [((a << 1) | (w == clo)) & M32 for a, w in zip(acc_before, want)]
-        if m.dst[S_ACC] != acc:
+        if m.dst[(S_ACC, od)] != acc:
             bad += 1
         if m.rwc != 0 or m.sched:
             m.errors.append('batch %d: RWC %d, %d instructions still scheduled' % (b, m.rwc, len(m.sched)))
+        # the constants must survive
+        if any(m.dst[(S_C + i - 4, ev)] != [(P + i * Q) & M32] * lanes for i in range(4, 26)):
+            m.errors.append('batch %d: constants overwritten' % b)
     return len(stream), bad, m.errors
 
 
@@ -462,8 +465,11 @@ def emit(seg, res, nstream):
  *   loaded from, so each pass leaves its S[] one slot further on.
  * - Both run in the cycle of a second, dummy SFPLOADMACRO, which schedules
  *   the sign flip of the rotate amount to run in the cycle of the next load.
- * - The first pass loads P + i*Q and stores S[i] elsewhere, with a plain
- *   store, in whose cycle the scheduled add runs.
+ * - The first pass loads P + i*Q instead. Those constants are in the even
+ *   columns of their Dst slots, and with DEST_WR_COL_EXCHANGE set every
+ *   store goes to the odd columns, so the scheduled stores leave them
+ *   alone. Everything stored is therefore loaded from the odd columns
+ *   (address + LM_ODD), and TRISC1 reads it back from there.
  * - The third pass stores S[] like the second, and the encryption loads it:
  *   each half round's load schedules the add of S[i], which runs in the
  *   cycle of the next half round's load.
@@ -474,9 +480,11 @@ def emit(seg, res, nstream):
  * 3 the sign-flipped rotate amount, 4 a rotate's left half, 5..7 L[0..2].
  * The encryption has eA, eB and S[i] in LRegs 1..3 in rotation.
  *
- * Dst slots: 0..27 S[]; 64..85 P + i*Q for i = 4..25, 86 and 87 S[0] and
- * S[1] of the key schedule prefix, 88 P + 3*Q, 89 on the dummy loads
- * (their address moves with the Dst RWC); the others as in r72tt_sfpu.h.
+ * Dst slots: 64..85 hold P + i*Q for i = 4..25 in their even columns, and
+ * 63..87 hold S[] in their odd columns: the first pass leaves S[i] in slot
+ * 60 + i, and the encryption finds it in slot 63 + i. 88 P + 3*Q, 89 on the
+ * dummy loads (their address moves with the Dst RWC); the others as in
+ * r72tt_sfpu.h.
 */
 
 #ifndef R72TT_SFPU_LM_H
@@ -491,18 +499,17 @@ def emit(seg, res, nstream):
 #define LM_L1  6
 #define LM_L2  7
 
-#define SLOT_LM_C(i)   SLOT(%d + (i) - 4)   /* P + i*Q, i = 4..25 */
-#define SLOT_LM_S0     SLOT(%d)
-#define SLOT_LM_S1     SLOT(%d)
+#define SLOT_LM_C(i)   SLOT(%d + (i) - 4)   /* P + i*Q, i = 4..25: even columns */
+#define SLOT_LM_S(n)   SLOT(%d + (n))       /* S[]: odd columns */
 #define SLOT_LM_INIT3  SLOT(%d)
 #define SLOT_LM_DUMMY  SLOT(%d)
+#define LM_ODD         2   /* added to a load's address: the odd columns */
 
 /* SFPLOADMACRO: load LReg d from Dst and schedule the instructions of
    sequence 'macro'. The low address bit is the top bit of d instead. */
 #define SFPLOADMACRO(macro, d, am, addr) \\
   TT_OP(0x93, ((((macro) << 2) + ((d) & 3)) << 20) + (SFP_INT32 << 16) + ((am) << 13) + \\
               (addr) + ((d) >> 2))
-#define SFPNOP                  TT_OP(0x8F, 0)
 #define SFPCONFIG_IMM(imm16, d) TT_OP(0x91, ((uint32_t)(imm16) << 8) + ((d) << 4) + 1)
 
 /* Sequences: per sub-unit a byte of 0x80 (the scheduled instruction's other
@@ -510,16 +517,14 @@ def emit(seg, res, nstream):
    (4 + template, or 3 for a store); the simple sub-unit's byte is the
    lowest and the store's the highest. */
 #define LM_MACRO_S   0   /* m += LReg 0 after 6; store LReg 0 after 6 */
-#define LM_MACRO_S1  1   /* m += LReg 0 after 6 */
-#define LM_MACRO_D   2   /* m = LReg 0 ^ 2^31 after 3 */
-#define LM_MACRO_E   3   /* m += LReg 4 after 5 */
+#define LM_MACRO_D   1   /* m = LReg 0 ^ 2^31 after 3 */
+#define LM_MACRO_E   2   /* m += LReg 4 after 5 */
 #define LM_SEQ_S     0xB30000B4u
-#define LM_SEQ_S1    0x000000B4u
 #define LM_SEQ_D     0x0000009Du
 #define LM_SEQ_E     0x000000AEu
 /* delays of all sub-units count issued instructions; stores are INT32 */
 #define LM_MISC      0xF04u
-''' % (nstream, S_C, S_C_S0, S_C_S1, S_INIT3, S_DUMMY))
+''' % (nstream, S_C, S_C, S_INIT3, S_DUMMY))
     rb = replay_body(seg)
     w('/* Replay buffer contents: three encryption half rounds */')
     w('#define LM_REPLAY_LEN %d' % len(rb))
@@ -529,9 +534,10 @@ def emit(seg, res, nstream):
         w('  %s,' % ins.text)
     w('};')
     w('')
-    w('''/* One-time setup after sfpu_setup(): templates, sequences, constants and
-   the replay buffer (replacing sfpu_setup()'s). An instruction with VD
-   12 + i is not executed but becomes template i. */
+    w('''/* One-time setup after sfpu_setup(): templates, sequences, constants, the
+   replay buffer (replacing sfpu_setup()'s), and stores to the odd columns
+   from here on. An instruction with VD 12 + i is not executed but becomes
+   template i. */
 static void sfpu_lm_setup(void)
 {
   uint32_t i;
@@ -542,9 +548,6 @@ static void sfpu_lm_setup(void)
   TTI(SFPNOP);
   sfpu_loadi32(0, LM_SEQ_S);
   TTI(SFPCONFIG(4 + LM_MACRO_S));
-  TTI(SFPNOP);
-  sfpu_loadi32(0, LM_SEQ_S1);
-  TTI(SFPCONFIG(4 + LM_MACRO_S1));
   TTI(SFPNOP);
   sfpu_loadi32(0, LM_SEQ_D);
   TTI(SFPCONFIG(4 + LM_MACRO_D));
@@ -562,6 +565,9 @@ static void sfpu_lm_setup(void)
     sfpu_loadi32(LM_X0, 0xB7E15163u + i * 0x9E3779B9u);
     tt_push(SFPSTORE(LM_X0, SLOT_LM_C(i)));
   }
+  TTI(SFPCONFIG_LANE(LANECONFIG_DEST_WR_COL_EXCHANGE));
+  TTI(SFPNOP);
+  sfpu_clear_acc();
 
   /* Recording with execution off: the recorded instructions must be pushed
      one store each, never as fused .ttinsn sequences */

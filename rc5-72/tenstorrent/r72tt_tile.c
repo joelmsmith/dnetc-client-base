@@ -294,6 +294,7 @@ static void run_sfpu(volatile r72tt_mailbox_t *mb)
   const uint32_t plain_lo = mb->plain_lo, plain_hi = mb->plain_hi;
   const uint32_t cypher_lo = mb->cypher_lo, cypher_hi = mb->cypher_hi;
   const int verify = (mb->flags & R72TT_FLAG_VERIFY) != 0;
+  /* the SFPLOADMACRO batch, which also stores to the odd columns of Dst */
   const int lm = (mb->flags & R72TT_FLAG_LOADMACRO) != 0;
   const uint32_t first = hi & 31;
   const uint32_t batches = (first + count + 31) / 32;
@@ -329,7 +330,7 @@ static void run_sfpu(volatile r72tt_mailbox_t *mb)
         if (idx < count)
         {
           rc5_72_check(&prefix, base + lane, plain_lo, plain_hi, cypher_lo, &a, &eb);
-          if (*(volatile uint32_t *)DST_SLOT_LANE(SLOT_EA, lane) != a)
+          if (*(volatile uint32_t *)DST_SLOT_LANE(SLOT_EA, lane, lm) != a)
             errors++;
         }
       }
@@ -347,13 +348,13 @@ static void run_sfpu(volatile r72tt_mailbox_t *mb)
     if (pending == 32 || b + 1 == batches)
     {
       uint32_t j, lane, bits[32], any = 0;
-      sfpu_flush_acc();
+      sfpu_flush_acc(lm);
       /* Dst reads are slow on silicon: read the OR of each row of eight
          lanes, then each lane's bits once if any is set */
       for (lane = 0; lane < 32; lane += 8)
-        any |= *(volatile uint32_t *)DST_SLOT_LANE(SLOT_ANY, lane);
+        any |= *(volatile uint32_t *)DST_SLOT_LANE(SLOT_ANY, lane, lm);
       for (lane = 0; lane < 32 && any; lane++)
-        bits[lane] = *(volatile uint32_t *)DST_SLOT_LANE(SLOT_ACC, lane);
+        bits[lane] = *(volatile uint32_t *)DST_SLOT_LANE(SLOT_ACC, lane, lm);
       sfpu_clear_acc();
       /* batch j of the group holds bit (pending - 1 - j); scan in key order */
       for (j = 0; j < pending && any && !found; j++)
@@ -382,6 +383,15 @@ static void run_sfpu(volatile r72tt_mailbox_t *mb)
       group += pending;
       pending = 0;
     }
+  }
+
+  if (lm)
+  {
+    /* leave stores going to the even columns again, as other users of the
+       SFPU expect */
+    TTI(SFPCONFIG_LANE(0));
+    TTI(SFPNOP);
+    sfpu_wait();
   }
 
   cycles = wall_clock() - start;

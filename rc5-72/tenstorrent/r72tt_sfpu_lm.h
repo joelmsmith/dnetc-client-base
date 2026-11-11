@@ -7,7 +7,7 @@
  * stream against a model of SFPLOADMACRO and a plain RC5-72. Do not edit.
  *
  * RC5-72 on the Tensix Vector Unit (SFPU) with SFPLOADMACRO: as
- * sfpu_batch() in r72tt_sfpu.h, in 999 instead of about 1100 cycles per 32
+ * sfpu_batch() in r72tt_sfpu.h, in 978 instead of about 1100 cycles per 32
  * keys. Not for the ttsim simulator, which does not implement SFPLOADMACRO.
  *
  * SFPLOADMACRO loads a register and schedules up to one instruction per
@@ -21,8 +21,11 @@
  *   loaded from, so each pass leaves its S[] one slot further on.
  * - Both run in the cycle of a second, dummy SFPLOADMACRO, which schedules
  *   the sign flip of the rotate amount to run in the cycle of the next load.
- * - The first pass loads P + i*Q and stores S[i] elsewhere, with a plain
- *   store, in whose cycle the scheduled add runs.
+ * - The first pass loads P + i*Q instead. Those constants are in the even
+ *   columns of their Dst slots, and with DEST_WR_COL_EXCHANGE set every
+ *   store goes to the odd columns, so the scheduled stores leave them
+ *   alone. Everything stored is therefore loaded from the odd columns
+ *   (address + LM_ODD), and TRISC1 reads it back from there.
  * - The third pass stores S[] like the second, and the encryption loads it:
  *   each half round's load schedules the add of S[i], which runs in the
  *   cycle of the next half round's load.
@@ -33,9 +36,11 @@
  * 3 the sign-flipped rotate amount, 4 a rotate's left half, 5..7 L[0..2].
  * The encryption has eA, eB and S[i] in LRegs 1..3 in rotation.
  *
- * Dst slots: 0..27 S[]; 64..85 P + i*Q for i = 4..25, 86 and 87 S[0] and
- * S[1] of the key schedule prefix, 88 P + 3*Q, 89 on the dummy loads
- * (their address moves with the Dst RWC); the others as in r72tt_sfpu.h.
+ * Dst slots: 64..85 hold P + i*Q for i = 4..25 in their even columns, and
+ * 63..87 hold S[] in their odd columns: the first pass leaves S[i] in slot
+ * 60 + i, and the encryption finds it in slot 63 + i. 88 P + 3*Q, 89 on the
+ * dummy loads (their address moves with the Dst RWC); the others as in
+ * r72tt_sfpu.h.
 */
 
 #ifndef R72TT_SFPU_LM_H
@@ -50,18 +55,17 @@
 #define LM_L1  6
 #define LM_L2  7
 
-#define SLOT_LM_C(i)   SLOT(64 + (i) - 4)   /* P + i*Q, i = 4..25 */
-#define SLOT_LM_S0     SLOT(86)
-#define SLOT_LM_S1     SLOT(87)
+#define SLOT_LM_C(i)   SLOT(64 + (i) - 4)   /* P + i*Q, i = 4..25: even columns */
+#define SLOT_LM_S(n)   SLOT(64 + (n))       /* S[]: odd columns */
 #define SLOT_LM_INIT3  SLOT(88)
 #define SLOT_LM_DUMMY  SLOT(89)
+#define LM_ODD         2   /* added to a load's address: the odd columns */
 
 /* SFPLOADMACRO: load LReg d from Dst and schedule the instructions of
    sequence 'macro'. The low address bit is the top bit of d instead. */
 #define SFPLOADMACRO(macro, d, am, addr) \
   TT_OP(0x93, ((((macro) << 2) + ((d) & 3)) << 20) + (SFP_INT32 << 16) + ((am) << 13) + \
               (addr) + ((d) >> 2))
-#define SFPNOP                  TT_OP(0x8F, 0)
 #define SFPCONFIG_IMM(imm16, d) TT_OP(0x91, ((uint32_t)(imm16) << 8) + ((d) << 4) + 1)
 
 /* Sequences: per sub-unit a byte of 0x80 (the scheduled instruction's other
@@ -69,11 +73,9 @@
    (4 + template, or 3 for a store); the simple sub-unit's byte is the
    lowest and the store's the highest. */
 #define LM_MACRO_S   0   /* m += LReg 0 after 6; store LReg 0 after 6 */
-#define LM_MACRO_S1  1   /* m += LReg 0 after 6 */
-#define LM_MACRO_D   2   /* m = LReg 0 ^ 2^31 after 3 */
-#define LM_MACRO_E   3   /* m += LReg 4 after 5 */
+#define LM_MACRO_D   1   /* m = LReg 0 ^ 2^31 after 3 */
+#define LM_MACRO_E   2   /* m += LReg 4 after 5 */
 #define LM_SEQ_S     0xB30000B4u
-#define LM_SEQ_S1    0x000000B4u
 #define LM_SEQ_D     0x0000009Du
 #define LM_SEQ_E     0x000000AEu
 /* delays of all sub-units count issued instructions; stores are INT32 */
@@ -88,24 +90,25 @@ static const uint32_t sfpu_lm_replay[LM_REPLAY_LEN] =
   SFPMOVNEG(LM_X1, LM_L0),
   SFPSHFT(0, LM_L0, LM_X0, SHFT_REG),
   SFPOR(0, LM_X0, LM_Y, LOGIC_VD),
-  SFPLOADMACRO(LM_MACRO_E, LM_X0, AM_NEXT, SLOT(4)),
+  SFPLOADMACRO(LM_MACRO_E, LM_X0, AM_NEXT, SLOT_LM_S(1) + LM_ODD),
   SFPXOR(LM_G, LM_X1),
   SFPSHFT2(LM_X1, LM_G, LM_Y, SHFT2_VB),
   SFPMOVNEG(LM_G, LM_L0),
   SFPSHFT(0, LM_L0, LM_X1, SHFT_REG),
   SFPOR(0, LM_X1, LM_Y, LOGIC_VD),
-  SFPLOADMACRO(LM_MACRO_E, LM_X1, AM_NEXT, SLOT(4)),
+  SFPLOADMACRO(LM_MACRO_E, LM_X1, AM_NEXT, SLOT_LM_S(1) + LM_ODD),
   SFPXOR(LM_X0, LM_G),
   SFPSHFT2(LM_G, LM_X0, LM_Y, SHFT2_VB),
   SFPMOVNEG(LM_X0, LM_L0),
   SFPSHFT(0, LM_L0, LM_G, SHFT_REG),
   SFPOR(0, LM_G, LM_Y, LOGIC_VD),
-  SFPLOADMACRO(LM_MACRO_E, LM_G, AM_NEXT, SLOT(4)),
+  SFPLOADMACRO(LM_MACRO_E, LM_G, AM_NEXT, SLOT_LM_S(1) + LM_ODD),
 };
 
-/* One-time setup after sfpu_setup(): templates, sequences, constants and
-   the replay buffer (replacing sfpu_setup()'s). An instruction with VD
-   12 + i is not executed but becomes template i. */
+/* One-time setup after sfpu_setup(): templates, sequences, constants, the
+   replay buffer (replacing sfpu_setup()'s), and stores to the odd columns
+   from here on. An instruction with VD 12 + i is not executed but becomes
+   template i. */
 static void sfpu_lm_setup(void)
 {
   uint32_t i;
@@ -116,9 +119,6 @@ static void sfpu_lm_setup(void)
   TTI(SFPNOP);
   sfpu_loadi32(0, LM_SEQ_S);
   TTI(SFPCONFIG(4 + LM_MACRO_S));
-  TTI(SFPNOP);
-  sfpu_loadi32(0, LM_SEQ_S1);
-  TTI(SFPCONFIG(4 + LM_MACRO_S1));
   TTI(SFPNOP);
   sfpu_loadi32(0, LM_SEQ_D);
   TTI(SFPCONFIG(4 + LM_MACRO_D));
@@ -136,6 +136,9 @@ static void sfpu_lm_setup(void)
     sfpu_loadi32(LM_X0, 0xB7E15163u + i * 0x9E3779B9u);
     tt_push(SFPSTORE(LM_X0, SLOT_LM_C(i)));
   }
+  TTI(SFPCONFIG_LANE(LANECONFIG_DEST_WR_COL_EXCHANGE));
+  TTI(SFPNOP);
+  sfpu_clear_acc();
 
   /* Recording with execution off: the recorded instructions must be pushed
      one store each, never as fused .ttinsn sequences */
@@ -152,19 +155,21 @@ static void sfpu_batch_lm(uint32_t base, int verify)
   /* prologue */
   TTI(SFPSHFT(-1, LR_LANE2, LM_L2, SHFT_IMM_VC));
   tt_push(SFPIADD(base, LM_L2, LM_L2, IADD_IMM));
-  TTI(SFPLOAD_AM(LM_G, AM_KEEP, SLOT_PAB));
+  TTI(SFPLOAD_AM(LM_G, AM_KEEP, SLOT_PAB + LM_ODD));
   TTI(SFPIADD(0, LM_G, LM_L2, IADD_REG));
   TTI(SFPSHFT2(LM_L2, LM_G, LM_Y, SHFT2_VB));
   TTI(SFPMOVNEG(LM_G, LM_G));
   TTI(SFPSHFT(0, LM_G, LM_L2, SHFT_REG));
-  TTI(SFPLOAD_AM(LM_A, AM_KEEP, SLOT_PS(2)));
-  TTI(SFPLOAD_AM(LM_L0, AM_KEEP, SLOT_PL(0)));
-  TTI(SFPLOAD_AM(LM_L1, AM_KEEP, SLOT_PL(1)));
-  TTI(SFPLOAD_AM(LM_X0, AM_KEEP, SLOT_PS(1)));
-  TTI(SFPSTORE_AM(LM_X0, AM_KEEP, SLOT_LM_S1));
-  TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+  TTI(SFPLOAD_AM(LM_A, AM_KEEP, SLOT_PS(2) + LM_ODD));
+  TTI(SFPLOAD_AM(LM_L0, AM_KEEP, SLOT_PL(0) + LM_ODD));
+  TTI(SFPLOAD_AM(LM_L1, AM_KEEP, SLOT_PL(1) + LM_ODD));
+  TTI(SFPLOAD_AM(LM_X0, AM_KEEP, SLOT_PS(1) + LM_ODD));
+  TTI(SFPSTORE_AM(LM_X0, AM_KEEP, SLOT_LM_S(23)));
+  TTI(SFPLOAD_AM(LM_X0, AM_KEEP, SLOT_PS(0) + LM_ODD));
+  TTI(SFPSTORE_AM(LM_X0, AM_KEEP, SLOT_LM_S(22)));
+  TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT_LM_S(-1)));
   TTI(SFPLOAD_AM(LM_X1, AM_KEEP, SLOT_LM_INIT3));
-  TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X0, AM_NEXT, SLOT(64)));
+  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_C(4)));
   TTI(SFPIADD(0, LM_A, LM_X1, IADD_REG));
   TTI(SFPOR(0, LM_Y, LM_L2, LOGIC_VD));
 
@@ -176,72 +181,66 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPSHFT(3, LM_X1, LM_Y, SHFT_IMM_VC));
     TTI(SFPSHFT(-29, LM_X1, LM_A, SHFT_IMM_VC));
     TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-    TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
     TTI(SFPIADD(0, LM_L2, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L0, IADD_REG));
     TTI(SFPSHFT2(LM_L0, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPMOVNEG(LM_A, LM_G));
-    TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X1, AM_NEXT, SLOT(64)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_C(4)));
     TTI(SFPSHFT(0, LM_G, LM_L0, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L0, LOGIC_VD));
     TTI(SFPIADD(0, LM_L0, LM_X0, IADD_REG));
     TTI(SFPSHFT(3, LM_X0, LM_Y, SHFT_IMM_VC));
     TTI(SFPSHFT(-29, LM_X0, LM_A, SHFT_IMM_VC));
     TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-    TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
     TTI(SFPIADD(0, LM_L0, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L1, IADD_REG));
     TTI(SFPSHFT2(LM_L1, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPMOVNEG(LM_A, LM_G));
-    TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X0, AM_NEXT, SLOT(64)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_C(4)));
     TTI(SFPSHFT(0, LM_G, LM_L1, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L1, LOGIC_VD));
     TTI(SFPIADD(0, LM_L1, LM_X1, IADD_REG));
     TTI(SFPSHFT(3, LM_X1, LM_Y, SHFT_IMM_VC));
     TTI(SFPSHFT(-29, LM_X1, LM_A, SHFT_IMM_VC));
     TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-    TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
     TTI(SFPIADD(0, LM_L1, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L2, IADD_REG));
     TTI(SFPSHFT2(LM_L2, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPMOVNEG(LM_A, LM_G));
-    TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X1, AM_NEXT, SLOT(64)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_C(4)));
     TTI(SFPSHFT(0, LM_G, LM_L2, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L2, LOGIC_VD));
     TTI(SFPIADD(0, LM_L2, LM_X0, IADD_REG));
     TTI(SFPSHFT(3, LM_X0, LM_Y, SHFT_IMM_VC));
     TTI(SFPSHFT(-29, LM_X0, LM_A, SHFT_IMM_VC));
     TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-    TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
     TTI(SFPIADD(0, LM_L2, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L0, IADD_REG));
     TTI(SFPSHFT2(LM_L0, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPMOVNEG(LM_A, LM_G));
-    TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X0, AM_NEXT, SLOT(64)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_C(4)));
     TTI(SFPSHFT(0, LM_G, LM_L0, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L0, LOGIC_VD));
     TTI(SFPIADD(0, LM_L0, LM_X1, IADD_REG));
     TTI(SFPSHFT(3, LM_X1, LM_Y, SHFT_IMM_VC));
     TTI(SFPSHFT(-29, LM_X1, LM_A, SHFT_IMM_VC));
     TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-    TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
     TTI(SFPIADD(0, LM_L0, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L1, IADD_REG));
     TTI(SFPSHFT2(LM_L1, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPMOVNEG(LM_A, LM_G));
-    TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X1, AM_NEXT, SLOT(64)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_C(4)));
     TTI(SFPSHFT(0, LM_G, LM_L1, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L1, LOGIC_VD));
     TTI(SFPIADD(0, LM_L1, LM_X0, IADD_REG));
     TTI(SFPSHFT(3, LM_X0, LM_Y, SHFT_IMM_VC));
     TTI(SFPSHFT(-29, LM_X0, LM_A, SHFT_IMM_VC));
     TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-    TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
     TTI(SFPIADD(0, LM_L1, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L2, IADD_REG));
     TTI(SFPSHFT2(LM_L2, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPMOVNEG(LM_A, LM_G));
-    TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X0, AM_NEXT, SLOT(64)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_C(4)));
     TTI(SFPSHFT(0, LM_G, LM_L2, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L2, LOGIC_VD));
   }
@@ -251,60 +250,55 @@ static void sfpu_batch_lm(uint32_t base, int verify)
   TTI(SFPSHFT(3, LM_X1, LM_Y, SHFT_IMM_VC));
   TTI(SFPSHFT(-29, LM_X1, LM_A, SHFT_IMM_VC));
   TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-  TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+  TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
   TTI(SFPIADD(0, LM_L2, LM_A, IADD_REG));
   TTI(SFPIADD(0, LM_A, LM_L0, IADD_REG));
   TTI(SFPSHFT2(LM_L0, LM_A, LM_Y, SHFT2_VB));
-  TTI(SFPMOVNEG(LM_A, LM_G));
-  TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X1, AM_NEXT, SLOT(64)));
+  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_C(4)));
   TTI(SFPSHFT(0, LM_G, LM_L0, SHFT_REG));
   TTI(SFPOR(0, LM_Y, LM_L0, LOGIC_VD));
   TTI(SFPIADD(0, LM_L0, LM_X0, IADD_REG));
   TTI(SFPSHFT(3, LM_X0, LM_Y, SHFT_IMM_VC));
   TTI(SFPSHFT(-29, LM_X0, LM_A, SHFT_IMM_VC));
   TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-  TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+  TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
   TTI(SFPIADD(0, LM_L0, LM_A, IADD_REG));
   TTI(SFPIADD(0, LM_A, LM_L1, IADD_REG));
   TTI(SFPSHFT2(LM_L1, LM_A, LM_Y, SHFT2_VB));
-  TTI(SFPMOVNEG(LM_A, LM_G));
-  TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X0, AM_NEXT, SLOT(64)));
+  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_C(4)));
   TTI(SFPSHFT(0, LM_G, LM_L1, SHFT_REG));
   TTI(SFPOR(0, LM_Y, LM_L1, LOGIC_VD));
   TTI(SFPIADD(0, LM_L1, LM_X1, IADD_REG));
   TTI(SFPSHFT(3, LM_X1, LM_Y, SHFT_IMM_VC));
   TTI(SFPSHFT(-29, LM_X1, LM_A, SHFT_IMM_VC));
   TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-  TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+  TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
   TTI(SFPIADD(0, LM_L1, LM_A, IADD_REG));
   TTI(SFPIADD(0, LM_A, LM_L2, IADD_REG));
   TTI(SFPSHFT2(LM_L2, LM_A, LM_Y, SHFT2_VB));
-  TTI(SFPMOVNEG(LM_A, LM_G));
-  TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X1, AM_NEXT, SLOT(64)));
+  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_C(4)));
   TTI(SFPSHFT(0, LM_G, LM_L2, SHFT_REG));
   TTI(SFPOR(0, LM_Y, LM_L2, LOGIC_VD));
   TTI(SFPIADD(0, LM_L2, LM_X0, IADD_REG));
   TTI(SFPSHFT(3, LM_X0, LM_Y, SHFT_IMM_VC));
   TTI(SFPSHFT(-29, LM_X0, LM_A, SHFT_IMM_VC));
   TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-  TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+  TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
   TTI(SFPIADD(0, LM_L2, LM_A, IADD_REG));
   TTI(SFPIADD(0, LM_A, LM_L0, IADD_REG));
   TTI(SFPSHFT2(LM_L0, LM_A, LM_Y, SHFT2_VB));
-  TTI(SFPMOVNEG(LM_A, LM_G));
-  TTI(SFPLOADMACRO(LM_MACRO_S1, LM_X0, AM_NEXT, SLOT(64)));
+  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_C(4) + LM_ODD));
   TTI(SFPSHFT(0, LM_G, LM_L0, SHFT_REG));
   TTI(SFPOR(0, LM_Y, LM_L0, LOGIC_VD));
   TTI(SFPIADD(0, LM_L0, LM_X1, IADD_REG));
   TTI(SFPSHFT(3, LM_X1, LM_Y, SHFT_IMM_VC));
   TTI(SFPSHFT(-29, LM_X1, LM_A, SHFT_IMM_VC));
   TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
-  TTI(SFPSTORE_AM(LM_A, AM_KEEP, SLOT(2)));
+  TTI(SFPLOADMACRO(LM_MACRO_D, LM_G, AM_KEEP, SLOT_LM_DUMMY));
   TTI(SFPIADD(0, LM_L0, LM_A, IADD_REG));
   TTI(SFPIADD(0, LM_A, LM_L1, IADD_REG));
   TTI(SFPSHFT2(LM_L1, LM_A, LM_Y, SHFT2_VB));
-  TTI(SFPMOVNEG(LM_A, LM_G));
-  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_CLEAR, SLOT(64)));
+  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_CLEAR, SLOT_LM_C(4) + LM_ODD));
   TTI(SFPSHFT(0, LM_G, LM_L1, SHFT_REG));
   TTI(SFPOR(0, LM_Y, LM_L1, LOGIC_VD));
 
@@ -320,7 +314,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L1, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L2, IADD_REG));
     TTI(SFPSHFT2(LM_L2, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_S(-1) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L2, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L2, LOGIC_VD));
     TTI(SFPIADD(0, LM_L2, LM_X1, IADD_REG));
@@ -331,7 +325,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L2, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L0, IADD_REG));
     TTI(SFPSHFT2(LM_L0, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_S(-1) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L0, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L0, LOGIC_VD));
     TTI(SFPIADD(0, LM_L0, LM_X0, IADD_REG));
@@ -342,7 +336,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L0, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L1, IADD_REG));
     TTI(SFPSHFT2(LM_L1, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_S(-1) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L1, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L1, LOGIC_VD));
     TTI(SFPIADD(0, LM_L1, LM_X1, IADD_REG));
@@ -353,7 +347,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L1, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L2, IADD_REG));
     TTI(SFPSHFT2(LM_L2, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_S(-1) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L2, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L2, LOGIC_VD));
     TTI(SFPIADD(0, LM_L2, LM_X0, IADD_REG));
@@ -364,7 +358,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L2, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L0, IADD_REG));
     TTI(SFPSHFT2(LM_L0, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_S(-1) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L0, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L0, LOGIC_VD));
     TTI(SFPIADD(0, LM_L0, LM_X1, IADD_REG));
@@ -375,7 +369,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L0, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L1, IADD_REG));
     TTI(SFPSHFT2(LM_L1, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT(2)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_S(-1) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L1, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L1, LOGIC_VD));
   }
@@ -389,7 +383,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
   TTI(SFPIADD(0, LM_L1, LM_A, IADD_REG));
   TTI(SFPIADD(0, LM_A, LM_L2, IADD_REG));
   TTI(SFPSHFT2(LM_L2, LM_A, LM_Y, SHFT2_VB));
-  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_CLEAR, SLOT(63)));
+  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_CLEAR, SLOT_LM_S(-1) + LM_ODD));
   TTI(SFPSHFT(0, LM_G, LM_L2, SHFT_REG));
   TTI(SFPOR(0, LM_Y, LM_L2, LOGIC_VD));
   TTI(SFPIADD(0, LM_L2, LM_X1, IADD_REG));
@@ -400,7 +394,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
   TTI(SFPIADD(0, LM_L2, LM_A, IADD_REG));
   TTI(SFPIADD(0, LM_A, LM_L0, IADD_REG));
   TTI(SFPSHFT2(LM_L0, LM_A, LM_Y, SHFT2_VB));
-  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_KEEP, SLOT(2)));
+  TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_KEEP, SLOT_LM_S(-1) + LM_ODD));
   TTI(SFPSHFT(0, LM_G, LM_L0, SHFT_REG));
   TTI(SFPOR(0, LM_Y, LM_L0, LOGIC_VD));
 
@@ -416,7 +410,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L0, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L1, IADD_REG));
     TTI(SFPSHFT2(LM_L1, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT(3)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_C(4) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L1, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L1, LOGIC_VD));
     TTI(SFPIADD(0, LM_L1, LM_X1, IADD_REG));
@@ -427,7 +421,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L1, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L2, IADD_REG));
     TTI(SFPSHFT2(LM_L2, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT(3)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_C(4) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L2, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L2, LOGIC_VD));
     TTI(SFPIADD(0, LM_L2, LM_X0, IADD_REG));
@@ -438,7 +432,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L2, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L0, IADD_REG));
     TTI(SFPSHFT2(LM_L0, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT(3)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_C(4) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L0, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L0, LOGIC_VD));
     TTI(SFPIADD(0, LM_L0, LM_X1, IADD_REG));
@@ -449,7 +443,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L0, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L1, IADD_REG));
     TTI(SFPSHFT2(LM_L1, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT(3)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_C(4) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L1, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L1, LOGIC_VD));
     TTI(SFPIADD(0, LM_L1, LM_X0, IADD_REG));
@@ -460,7 +454,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L1, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L2, IADD_REG));
     TTI(SFPSHFT2(LM_L2, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT(3)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X0, AM_NEXT, SLOT_LM_C(4) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L2, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L2, LOGIC_VD));
     TTI(SFPIADD(0, LM_L2, LM_X1, IADD_REG));
@@ -471,7 +465,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
     TTI(SFPIADD(0, LM_L2, LM_A, IADD_REG));
     TTI(SFPIADD(0, LM_A, LM_L0, IADD_REG));
     TTI(SFPSHFT2(LM_L0, LM_A, LM_Y, SHFT2_VB));
-    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT(3)));
+    TTI(SFPLOADMACRO(LM_MACRO_S, LM_X1, AM_NEXT, SLOT_LM_C(4) + LM_ODD));
     TTI(SFPSHFT(0, LM_G, LM_L0, SHFT_REG));
     TTI(SFPOR(0, LM_Y, LM_L0, LOGIC_VD));
   }
@@ -482,12 +476,12 @@ static void sfpu_batch_lm(uint32_t base, int verify)
   TTI(SFPSHFT(-29, LM_X0, LM_A, SHFT_IMM_VC));
   TTI(SFPOR(0, LM_Y, LM_A, LOGIC_VD));
   TTI(SFPLOAD_AM(LM_X0, AM_CLEAR, SLOT(29)));
-  TTI(SFPLOAD_AM(LM_Y, AM_KEEP, SLOT(2)));
+  TTI(SFPLOAD_AM(LM_Y, AM_KEEP, SLOT_LM_S(-1) + LM_ODD));
   TTI(SFPIADD(0, LM_Y, LM_X0, IADD_REG));
   TTI(SFPLOAD_AM(LM_X1, AM_KEEP, SLOT_PLAIN_HI));
-  TTI(SFPLOAD_AM(LM_Y, AM_KEEP, SLOT(3)));
+  TTI(SFPLOAD_AM(LM_Y, AM_KEEP, SLOT_LM_C(4) + LM_ODD));
   TTI(SFPIADD(0, LM_Y, LM_X1, IADD_REG));
-  TTI(SFPLOADMACRO(LM_MACRO_E, LM_G, AM_NEXT, SLOT(4)));
+  TTI(SFPLOADMACRO(LM_MACRO_E, LM_G, AM_NEXT, SLOT_LM_S(1) + LM_ODD));
 
   /* half rounds with S[2..22] */
 #pragma GCC unroll 1
@@ -500,7 +494,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
   TTI(SFPMOVNEG(LM_X1, LM_L0));
   TTI(SFPSHFT(0, LM_L0, LM_X0, SHFT_REG));
   TTI(SFPOR(0, LM_X0, LM_Y, LOGIC_VD));
-  TTI(SFPLOADMACRO(LM_MACRO_E, LM_X0, AM_CLEAR, SLOT(4)));
+  TTI(SFPLOADMACRO(LM_MACRO_E, LM_X0, AM_CLEAR, SLOT_LM_S(1) + LM_ODD));
   TTI(SFPXOR(LM_G, LM_X1));
   TTI(SFPSHFT2(LM_X1, LM_G, LM_Y, SHFT2_VB));
   TTI(SFPMOVNEG(LM_G, LM_L0));
@@ -508,7 +502,7 @@ static void sfpu_batch_lm(uint32_t base, int verify)
   TTI(SFPOR(0, LM_X1, LM_Y, LOGIC_VD));
 
   /* compare */
-  TTI(SFPLOAD_AM(LM_L1, AM_KEEP, SLOT_ACC));
+  TTI(SFPLOAD_AM(LM_L1, AM_KEEP, SLOT_ACC + LM_ODD));
   if (verify)
     TTI(SFPSTORE_AM(LM_X0, AM_KEEP, SLOT_EA));
   TTI(SFPXOR(LR_CLO, LM_X0));
