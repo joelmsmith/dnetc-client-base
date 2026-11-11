@@ -3,8 +3,8 @@
  * For use in distributed.net projects only.
  * Any other distribution or use of this source violates copyright.
  *
- * Interface of the scalar key scan in r72tt_scan.S, shared by the firmware
- * C code and the assembly.
+ * Interface of the key scans in r72tt_scan.S and r72tt_scan_rvv.S, shared
+ * by the firmware C code and the assembly.
 */
 
 #ifndef R72TT_SCAN_H
@@ -41,6 +41,12 @@ typedef struct
 /* Checks low key bytes hi .. hi + n - 1 (n >= 1, hi + n <= 256); returns
    the index of the first whose encrypted low word is cypher_lo, else n */
 uint32_t r72tt_scan(const scan_t *ctx, uint32_t hi, uint32_t n);
+
+/* TRISC2 only. Checks low key bytes hi .. hi + n - 1 in blocks of 16 (hi
+   and n multiples of 16, n >= 16, hi + n <= 256); returns the index of the
+   first block with a key whose encrypted low word is cypher_lo, else n.
+   ea[] receives the encrypted low words of the last block checked. */
+uint32_t r72tt_scan_rvv(const scan_t *ctx, uint32_t hi, uint32_t n, uint32_t ea[16]);
 
 #endif /* __ASSEMBLER__ */
 #endif /* R72TT_SCAN_H */

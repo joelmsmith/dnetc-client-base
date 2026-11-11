@@ -4,8 +4,9 @@
  * Any other distribution or use of this source violates copyright.
  *
  * RC5-72 cores for Tenstorrent devices. All five RISC-V cores of every
- * Tensix tile run persistent firmware (r72tt_tile.c); with the SFPU core,
- * TRISC1 drives the tile's Vector Unit instead of checking keys itself.
+ * Tensix tile run persistent firmware (r72tt_tile.c); with the SFPU cores,
+ * TRISC1 drives the tile's Vector Unit instead of checking keys itself,
+ * and with the RVV core TRISC2 also checks keys with its own vector unit.
  * Each call splits the keys into one contiguous range per core ("worker"),
  * sized by the worker's speed, and merges the per-worker results in key
  * order, so the outcome matches a sequential core exactly.
@@ -25,6 +26,7 @@
 
 extern "C" s32 rc5_72_unit_func_tt_riscv (RC5_72UnitWork *, u32 *, void *);
 extern "C" s32 rc5_72_unit_func_tt_sfpu (RC5_72UnitWork *, u32 *, void *);
+extern "C" s32 rc5_72_unit_func_tt_sfpu_rvv (RC5_72UnitWork *, u32 *, void *);
 extern "C" s32 CDECL rc5_72_unit_func_ansi_1 (RC5_72UnitWork *, u32 *, void *);
 
 /* Firmware image (r72tt_tile_fw.cpp), generated from the firmware sources
@@ -41,8 +43,33 @@ extern "C" const unsigned int r72tt_tile_fw_size;
 
 /* Worker classes, and their initial speed estimates in clocks per key */
 #define CLASS_SCALAR 0
-#define CLASS_SFPU   1
-static const double initial_clocks_per_key[2] = { 653.0, 45.0 };
+#define CLASS_SFPU   1   /* TRISC1 driving the Vector Unit */
+#define CLASS_RVV    2   /* TRISC2 using its RISC-V vector unit */
+#define CLASSES      3
+static const double initial_clocks_per_key[CLASSES] = { 560.0, 35.0, 300.0 };
+static const u32 class_flags[CLASSES] = { 0, R72TT_FLAG_SFPU, R72TT_FLAG_RVV };
+static const char * const class_name[CLASSES] = { "RISC-V", "SFPU", "RVV" };
+
+/* What the cores use besides the scalar code */
+#define MODE_RISCV     0
+#define MODE_SFPU      1
+#define MODE_SFPU_RVV  2
+
+static int mode_uses_class(int mode, int cls)
+{
+  return cls == CLASS_SCALAR || (cls == CLASS_SFPU && mode >= MODE_SFPU) ||
+         (cls == CLASS_RVV && mode == MODE_SFPU_RVV);
+}
+
+/* The class of RISC-V core 'core' of a tile */
+static int worker_class(int mode, unsigned core)
+{
+  if (core == R72TT_CORE_TRISC1 && mode_uses_class(mode, CLASS_SFPU))
+    return CLASS_SFPU;
+  if (core == R72TT_CORE_TRISC2 && mode_uses_class(mode, CLASS_RVV))
+    return CLASS_RVV;
+  return CLASS_SCALAR;
+}
 
 typedef struct
 {
@@ -56,9 +83,9 @@ typedef struct
 typedef struct
 {
   int booted;
-  int checked[2];      /* self_check() passed, per worker class */
+  int checked[CLASSES];   /* self_check() passed, per worker class */
   u32 seq;
-  double clocks_per_key[2];
+  double clocks_per_key[CLASSES];
   job_t jobs[R72TT_MAX_WORKERS];
   u32 workers[R72TT_MAX_WORKERS];
 } device_state_t;
@@ -248,28 +275,32 @@ static int boot_firmware(tt_device_t *dev, int devicenum)
     }
   }
   device_state[devicenum].seq = 0;
-  device_state[devicenum].clocks_per_key[CLASS_SCALAR] = initial_clocks_per_key[CLASS_SCALAR];
-  device_state[devicenum].clocks_per_key[CLASS_SFPU] = initial_clocks_per_key[CLASS_SFPU];
+  for (c = 0; c < CLASSES; c++)
+    device_state[devicenum].clocks_per_key[c] = initial_clocks_per_key[c];
   return 0;
 }
 
 /*
- * Checks one kind of worker on every tile before first use: the scalar code
- * on each of the five RISC-V cores, or with 'use_sfpu' every tile's SFPU
- * worker, in verify mode, so that the SFPU's result for every key is also
- * compared against the scalar code.
+ * Checks one class of worker on every tile before first use: the scalar
+ * code on each of the five RISC-V cores, or every tile's SFPU or RVV
+ * worker. With 'verify' that worker runs in verify mode, so that its result
+ * for every key (RVV: every key in a whole block of 16) is also compared
+ * against the scalar code.
  *
  * Each job must find a key planted 27 keys past a carry out of key byte
  * d - 1 into byte d (d = 1..8, in rotation; byte 0 is RC5_72UnitWork.L0.hi),
  * so the firmware's key increment is checked at every carry depth against
- * the host's key_add(). The other key bytes are pseudo-random.
+ * the host's key_add(). The other key bytes are pseudo-random. For the RVV
+ * workers the planted key also moves from tile to tile, through all 16
+ * positions in a block.
  */
-static int self_check(tt_device_t *dev, int devicenum, int use_sfpu)
+static int self_check(tt_device_t *dev, int devicenum, int cls, int verify)
 {
   job_t *jobs = device_state[devicenum].jobs;
   u32 *workers = device_state[devicenum].workers;
-  const u32 count = 100, carry_at = 50, planted = 77;
-  const unsigned n = use_sfpu ? dev->tile_count : dev->tile_count * R72TT_CORES;
+  const u32 count = 100, carry_at = 50;
+  const unsigned n = cls != CLASS_SCALAR ? dev->tile_count : dev->tile_count * R72TT_CORES;
+  const unsigned core = cls == CLASS_SFPU ? R72TT_CORE_TRISC1 : R72TT_CORE_TRISC2;
   RC5_72UnitWork w;
   unsigned i, failed = 0;
   u32 seq = ++device_state[devicenum].seq;
@@ -283,6 +314,7 @@ static int self_check(tt_device_t *dev, int devicenum, int use_sfpu)
     /* five cores per tile and eight depths: every core of a tile gets a
        different depth, and each kind of core gets all of them */
     const unsigned depth = 1 + i % 8;
+    const u32 planted = 77 + (cls == CLASS_RVV ? i % 16 : 0);
     u32 bytes[9], hi, mid, lo, clo, chi;
     unsigned b;
 
@@ -291,7 +323,7 @@ static int self_check(tt_device_t *dev, int devicenum, int use_sfpu)
       seed = seed * 1103515245u + 12345u;
       bytes[b] = (b == 0) ? 0xFFu - (carry_at - 1) : (b < depth) ? 0xFFu : seed >> 24;
     }
-    jobs[i].worker = workers[i] = use_sfpu ? i * R72TT_CORES + R72TT_CORE_TRISC1 : i;
+    jobs[i].worker = workers[i] = cls != CLASS_SCALAR ? i * R72TT_CORES + core : i;
     jobs[i].offset = 0;
     jobs[i].count = count;
     jobs[i].hi = bytes[0];
@@ -304,7 +336,7 @@ static int self_check(tt_device_t *dev, int devicenum, int use_sfpu)
     rc5_72_encrypt(hi, mid, lo, w.plain.lo, w.plain.hi, &clo, &chi);
     w.cypher.lo = clo;
     w.cypher.hi = chi;
-    post_job(dev, &jobs[i], &w, use_sfpu ? R72TT_FLAG_SFPU | R72TT_FLAG_VERIFY : 0, seq);
+    post_job(dev, &jobs[i], &w, class_flags[cls] | (verify ? R72TT_FLAG_VERIFY : 0), seq);
   }
   if (wait_workers(dev, workers, n, offsetof(r72tt_mailbox_t, done_seq), seq,
                    (ui64)count * R72TT_MAX_CLOCKS_PER_KEY * 4 + R72TT_BOOT_CLOCKS) < 0)
@@ -314,6 +346,7 @@ static int self_check(tt_device_t *dev, int devicenum, int use_sfpu)
   }
   for (i = 0; i < n; i++)
   {
+    const u32 planted = 77 + (cls == CLASS_RVV ? i % 16 : 0);
     r72tt_mailbox_t mb;
 
     read_job_result(dev, &jobs[i], &mb);
@@ -329,7 +362,7 @@ static int self_check(tt_device_t *dev, int devicenum, int use_sfpu)
   if (failed)
   {
     Log("Tenstorrent: %s self-check failed on %u of %u cores of device %d\n",
-        use_sfpu ? "SFPU" : "RISC-V", failed, n, devicenum);
+        class_name[cls], failed, n, devicenum);
     return -1;
   }
   return 0;
@@ -340,29 +373,29 @@ static int self_check(tt_device_t *dev, int devicenum, int use_sfpu)
    the partial matches in [0, *keys_done]. Returns 1 for a full match, 0 if
    none, < 0 on device failure. */
 static int run_keys(tt_device_t *dev, int devicenum, const RC5_72UnitWork *w, u32 count,
-                    int use_sfpu, u32 *keys_done, u32 *cmc, u32 *cmc_index)
+                    int mode, u32 *keys_done, u32 *cmc, u32 *cmc_index)
 {
   device_state_t *ds = &device_state[devicenum];
   job_t *jobs = ds->jobs;
   u32 *job_workers = ds->workers;
   const unsigned workers = dev->tile_count * R72TT_CORES;
-  const u32 flags = use_sfpu ? R72TT_FLAG_SFPU : 0;
-  double weight[2], total_weight = 0, cumulative = 0;
-  ui64 class_keys[2] = { 0, 0 }, class_cycles[2] = { 0, 0 };
+  double weight[CLASSES], total_weight = 0, cumulative = 0;
+  ui64 class_keys[CLASSES] = { 0, 0, 0 }, class_cycles[CLASSES] = { 0, 0, 0 };
   unsigned i, n = 0;
   u32 offset = 0, seq;
   si64 clocks;
   int found = 0;
 
   /* Size every worker's range by its expected speed */
-  weight[CLASS_SCALAR] = 1.0 / ds->clocks_per_key[CLASS_SCALAR];
-  weight[CLASS_SFPU] = use_sfpu ? 1.0 / ds->clocks_per_key[CLASS_SFPU] : weight[CLASS_SCALAR];
-  total_weight = dev->tile_count * ((R72TT_CORES - 1) * weight[CLASS_SCALAR] + weight[CLASS_SFPU]);
+  for (i = 0; i < CLASSES; i++)
+    weight[i] = 1.0 / ds->clocks_per_key[i];
+  for (i = 0; i < R72TT_CORES; i++)
+    total_weight += dev->tile_count * weight[worker_class(mode, i)];
 
   seq = ++ds->seq;
   for (i = 0; i < workers; i++)
   {
-    const int cls = (use_sfpu && i % R72TT_CORES == R72TT_CORE_TRISC1) ? CLASS_SFPU : CLASS_SCALAR;
+    const int cls = worker_class(mode, i % R72TT_CORES);
     u32 end;
 
     cumulative += weight[cls];
@@ -376,7 +409,7 @@ static int run_keys(tt_device_t *dev, int devicenum, const RC5_72UnitWork *w, u3
     jobs[n].mid = w->L0.mid;
     jobs[n].lo = w->L0.lo;
     key_add(&jobs[n].hi, &jobs[n].mid, &jobs[n].lo, offset);
-    post_job(dev, &jobs[n], w, flags, seq);
+    post_job(dev, &jobs[n], w, class_flags[cls], seq);
     offset = end;
     n++;
   }
@@ -396,7 +429,7 @@ static int run_keys(tt_device_t *dev, int devicenum, const RC5_72UnitWork *w, u3
   *keys_done = count;
   for (i = 0; i < n; i++)
   {
-    const int cls = (use_sfpu && jobs[i].worker % R72TT_CORES == R72TT_CORE_TRISC1) ? CLASS_SFPU : CLASS_SCALAR;
+    const int cls = worker_class(mode, jobs[i].worker % R72TT_CORES);
     r72tt_mailbox_t mb;
 
     read_job_result(dev, &jobs[i], &mb);
@@ -408,7 +441,7 @@ static int run_keys(tt_device_t *dev, int devicenum, const RC5_72UnitWork *w, u3
     }
     if (mb.verify_errors)
     {
-      /* a candidate of the assembly scan that the C check did not confirm */
+      /* a candidate of an assembly scan that the C check did not confirm */
       Log("Tenstorrent: key scan and check disagree on tile %u core %u of device %d\n",
           jobs[i].worker / R72TT_CORES, jobs[i].worker % R72TT_CORES, devicenum);
       return -1;
@@ -432,8 +465,8 @@ static int run_keys(tt_device_t *dev, int devicenum, const RC5_72UnitWork *w, u3
     }
   }
 
-  /* Track the speeds of both worker classes, from runs long enough to tell */
-  for (i = 0; i < 2; i++)
+  /* Track the speeds of the worker classes, from runs long enough to tell */
+  for (i = 0; i < CLASSES; i++)
   {
     if (class_keys[i] >= 256u * dev->tile_count)
     {
@@ -445,13 +478,15 @@ static int run_keys(tt_device_t *dev, int devicenum, const RC5_72UnitWork *w, u3
   if (show_stats > 0)
   {
     /* kept short: screen output is cut at 80 columns */
-    Log("TT: %u keys, %u jobs, %u clk, clk/key %.1f/%.1f\n", count, n, (u32)clocks,
-        ds->clocks_per_key[CLASS_SCALAR], use_sfpu ? ds->clocks_per_key[CLASS_SFPU] : 0.0);
+    Log("TT: %u keys, %u jobs, clk/key %.1f/%.1f/%.1f\n", count, n,
+        ds->clocks_per_key[CLASS_SCALAR],
+        mode_uses_class(mode, CLASS_SFPU) ? ds->clocks_per_key[CLASS_SFPU] : 0.0,
+        mode_uses_class(mode, CLASS_RVV) ? ds->clocks_per_key[CLASS_RVV] : 0.0);
   }
   return found;
 }
 
-static s32 rc5_72_unit_func_tt(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, int use_sfpu)
+static s32 rc5_72_unit_func_tt(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, int mode)
 {
   const int devicenum = rc5_72unitwork->devicenum;
   device_state_t *ds;
@@ -470,6 +505,14 @@ static s32 rc5_72_unit_func_tt(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, 
     RaiseExitRequestTrigger();
     return -1;
   }
+  if (dev->is_sim && mode_uses_class(mode, CLASS_RVV))
+  {
+    /* core selection substitutes another core, so this is not reached */
+    Log("Tenstorrent: the simulator does not have the RISC-V vector unit\n");
+    tt_unlock_device(devicenum);
+    RaiseExitRequestTrigger();
+    return -1;
+  }
   ds = &device_state[devicenum];
   if (!ds->booted)
   {
@@ -481,12 +524,15 @@ static s32 rc5_72_unit_func_tt(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, 
     }
     ds->booted = 1;
   }
-  /* The SFPU core also uses the scalar code, on the other four cores */
-  for (cls = CLASS_SCALAR; cls <= (use_sfpu ? CLASS_SFPU : CLASS_SCALAR); cls++)
+  /* Every core also uses the scalar code, on the other RISC-V cores */
+  for (cls = 0; cls < CLASSES; cls++)
   {
-    if (ds->checked[cls])
+    if (ds->checked[cls] || !mode_uses_class(mode, cls))
       continue;
-    if (self_check(dev, devicenum, cls == CLASS_SFPU) < 0)
+    /* The RVV worker scans differently in verify mode (one block per call
+       of its key scan), so it is also checked as it normally runs */
+    if (self_check(dev, devicenum, cls, cls != CLASS_SCALAR) < 0 ||
+        (cls == CLASS_RVV && self_check(dev, devicenum, cls, 0) < 0))
     {
       tt_unlock_device(devicenum);
       RaiseExitRequestTrigger();
@@ -496,7 +542,7 @@ static s32 rc5_72_unit_func_tt(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, 
   }
 
   found = (*iterations == 0) ? 0 :
-          run_keys(dev, devicenum, rc5_72unitwork, *iterations, use_sfpu, &keys_done, &cmc, &cmc_index);
+          run_keys(dev, devicenum, rc5_72unitwork, *iterations, mode, &keys_done, &cmc, &cmc_index);
   tt_unlock_device(devicenum);
   if (found < 0)
   {
@@ -543,10 +589,15 @@ static s32 rc5_72_unit_func_tt(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, 
 
 s32 rc5_72_unit_func_tt_riscv(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, void *)
 {
-  return rc5_72_unit_func_tt(rc5_72unitwork, iterations, 0);
+  return rc5_72_unit_func_tt(rc5_72unitwork, iterations, MODE_RISCV);
 }
 
 s32 rc5_72_unit_func_tt_sfpu(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, void *)
 {
-  return rc5_72_unit_func_tt(rc5_72unitwork, iterations, 1);
+  return rc5_72_unit_func_tt(rc5_72unitwork, iterations, MODE_SFPU);
+}
+
+s32 rc5_72_unit_func_tt_sfpu_rvv(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, void *)
+{
+  return rc5_72_unit_func_tt(rc5_72unitwork, iterations, MODE_SFPU_RVV);
 }

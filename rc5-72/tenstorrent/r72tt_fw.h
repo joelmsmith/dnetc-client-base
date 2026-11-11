@@ -34,13 +34,16 @@
 #define R72TT_ENTRY_STRIDE    16u
 
 #define R72TT_MAGIC_READY     0x52373254u   /* "R72T", written by firmware at boot */
-#define R72TT_ABI_VERSION     3u
+#define R72TT_ABI_VERSION     4u
 
 /* Mailbox flags. TRISC1 drives the Vector Unit (SFPU) when FLAG_SFPU is
-   set; FLAG_VERIFY then additionally checks every key's SFPU result
-   against the scalar core, counting differences in verify_errors. */
+   set, and TRISC2 uses its RISC-V vector unit when FLAG_RVV is set (other
+   cores ignore these). FLAG_VERIFY then additionally checks every key's
+   vector result against the scalar code, counting differences in
+   verify_errors. */
 #define R72TT_FLAG_SFPU       1u
 #define R72TT_FLAG_VERIFY     2u
+#define R72TT_FLAG_RVV        4u
 
 typedef struct
 {
@@ -64,7 +67,7 @@ typedef struct
   uint32_t found;          /* 1 if keys_done is a full match */
   uint32_t cycles_lo, cycles_hi;      /* device clocks spent on the run */
   uint32_t verify_errors;             /* see R72TT_FLAG_VERIFY; scalar runs:
-                                         candidates of the assembly scan
+                                         candidates of the assembly scans
                                          that the C check rejects */
 } r72tt_mailbox_t;
 

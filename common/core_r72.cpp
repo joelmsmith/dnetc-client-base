@@ -118,6 +118,7 @@ extern "C" s32 rc5_72_unit_func_ocl_4pipe (RC5_72UnitWork *rc5_72unitwork, u32 *
 #elif (CLIENT_CPU == CPU_TENSTORRENT)
 extern "C" s32 rc5_72_unit_func_tt_riscv (RC5_72UnitWork *rc5_72unitwork, u32 *iterations, void *);
 extern "C" s32 rc5_72_unit_func_tt_sfpu (RC5_72UnitWork *rc5_72unitwork, u32 *iterations, void *);
+extern "C" s32 rc5_72_unit_func_tt_sfpu_rvv (RC5_72UnitWork *rc5_72unitwork, u32 *iterations, void *);
 #elif (CLIENT_CPU == CPU_ARM64)
 extern "C" s32 rc5_72_unit_func_monika_4pipe(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, void *);
 extern "C" s32 rc5_72_unit_func_monika_2pipe(RC5_72UnitWork *rc5_72unitwork, u32 *iterations, void *);
@@ -258,6 +259,7 @@ const char **corenames_for_contest_rc572()
   #elif (CLIENT_CPU == CPU_TENSTORRENT)
       "RISC-V x5",
       "SFPU + RISC-V x4",
+      "SFPU + RVV + RISC-V x3",
   #else
       "ANSI 4-pipe",
       "ANSI 2-pipe",
@@ -369,6 +371,14 @@ int apply_selcore_substitution_rules_rc572(int cindex, int device)
   if(GetProcessorType(1, device) >= 20 )  /* UAV support in Tahiti is currently broken */
     if(cindex == 3)
       cindex = 0;
+#elif (CLIENT_CPU == CPU_TENSTORRENT)
+  {
+    /* the ttsim simulator (see readme.tenstorrent) does not have the RISC-V
+       vector unit */
+    const char *sim = getenv("DNETC_TTSIM");
+    if (cindex == 2 && sim && *sim)
+      cindex = 1;    /* SFPU + RISC-V x4 */
+  }
 #endif
 
   return cindex;
@@ -717,7 +727,7 @@ int selcoreGetPreselectedCoreForProject_rc572(int device)
   #elif (CLIENT_CPU == CPU_CUDA)
     cindex = 0; // 1-pipe 64-threads
   #elif (CLIENT_CPU == CPU_TENSTORRENT)
-    cindex = 1; // SFPU + RISC-V x4
+    cindex = apply_selcore_substitution_rules_rc572(2, device); // SFPU + RVV + RISC-V x3, or #1 on the simulator
   #elif (CLIENT_CPU == CPU_OPENCL)
     switch (detected_type)
     {
@@ -1070,10 +1080,14 @@ int selcoreSelectCore_rc572(Client *client, unsigned int threadindex,
         pipeline_count = 1;
         break;
       case 1:
-      default:
         unit_func.gen_72 = rc5_72_unit_func_tt_sfpu;
         pipeline_count = 1;
-        coresel = 1; // yes, we explicitly set coresel in the default case !
+        break;
+      case 2:
+      default:
+        unit_func.gen_72 = rc5_72_unit_func_tt_sfpu_rvv;
+        pipeline_count = 1;
+        coresel = 2; // yes, we explicitly set coresel in the default case !
         break;
 
     // -----------

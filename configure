@@ -847,7 +847,7 @@ add_sources() # $1=os, $2=arch, $3=custom
                           rc5-72/tenstorrent/r72tt.cpp \
                           rc5-72/tenstorrent/r72tt_tile_fw.cpp"
       # r72tt_tile_fw.cpp is generated from this by 'make tt-firmware'
-      TARGET_TTFW="rc5-72/tenstorrent/r72tt_tile.c rc5-72/tenstorrent/r72tt_scan.S"
+      TARGET_TTFW="rc5-72/tenstorrent/r72tt_tile.c rc5-72/tenstorrent/r72tt_scan.S rc5-72/tenstorrent/r72tt_scan_rvv.S"
     fi # HAVE_RC5_72
 
   #-----------------------------------------------------------------

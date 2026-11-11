@@ -60,12 +60,17 @@
 
     Every Tensix tile of the device has five small RISC-V cores and a
     32-lane vector unit (SFPU). The client loads its own firmware onto all
-    of the tiles. There are two RC5-72 cores:
+    of the tiles. There are three RC5-72 cores:
 
     #0 "RISC-V x5": all five RISC-V cores of every tile check keys.
     #1 "SFPU + RISC-V x4": one RISC-V core of every tile drives its vector
        unit, checking 32 keys at a time; the other four check keys
-       themselves. This is the default and is much faster.
+       themselves. Much faster than #0.
+    #2 "SFPU + RVV + RISC-V x3": as #1, and one of the four other RISC-V
+       cores, the only one with the RISC-V vector extension, checks 16
+       keys at a time with it. This is the default and the fastest. It is
+       not available on the ttsim simulator, which does not have that
+       vector extension; core #1 is the default there.
 
   2.2   Running on the ttsim simulator ----------------------------------
 
@@ -86,9 +91,9 @@
 
     Before a core is first used, the client checks it on every tile of the
     device: every RISC-V core must find a key planted in a range of keys
-    that crosses a carry in the key, and for core #1 every vector unit must
-    do the same, with its result for every key compared with the RISC-V
-    code's result. A failure is reported and stops the client, as is a
+    that crosses a carry in the key, and for cores #1 and #2 every vector
+    unit used must do the same, with its results compared key by key with
+    the scalar RISC-V code's results. A failure is reported and stops the client, as is a
     device that reports inconsistent results later on. Any key found by the
     device is also re-checked on the host before it is reported.
 
@@ -113,12 +118,13 @@
   3.1   Device firmware ----------------------------------------------
 
     The firmware the client loads onto the device is built from
-    rc5-72/tenstorrent/r72tt_tile.c and r72tt_scan.S. Its image is
-    included in the source as rc5-72/tenstorrent/r72tt_tile_fw.cpp, so
-    that building the client does not need a RISC-V compiler. After
-    changing the firmware sources, regenerate the image with the SFPI
-    toolchain <https://github.com/tenstorrent/sfpi/releases> (version
-    7.94.0 was used for the included image):
+    rc5-72/tenstorrent/r72tt_tile.c, r72tt_scan.S and r72tt_scan_rvv.S.
+    Its image is included in the source as
+    rc5-72/tenstorrent/r72tt_tile_fw.cpp, so that building the client does
+    not need a RISC-V compiler. After changing the firmware sources,
+    regenerate the image with the SFPI toolchain
+    <https://github.com/tenstorrent/sfpi/releases> (version 7.94.0 was used
+    for the included image):
 
         SFPI_PATH=/path/to/sfpi ./configure linux-amd64-tenstorrent
         make tt-firmware

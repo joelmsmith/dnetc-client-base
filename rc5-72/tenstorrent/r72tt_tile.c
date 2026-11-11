@@ -5,7 +5,8 @@
  *
  * RC5-72 key search firmware for a Tenstorrent Tensix tile. All five RISC-V
  * cores run this code; TRISC1 can instead drive the Vector Unit (see
- * r72tt_sfpu.h). See r72tt_fw.h for the host interface.
+ * r72tt_sfpu.h), and TRISC2 can use its RISC-V vector unit (see
+ * r72tt_scan_rvv.S). See r72tt_fw.h for the host interface.
  *
  * The scalar core (r72tt_scan.S) checks one key at a time, fully unrolled,
  * and rc5_72_check() below rechecks its candidates. The key's low
@@ -119,8 +120,9 @@ static void key_prefix(uint32_t mid, uint32_t lo, prefix_t *p)
 
 /* Encrypts the plaintext with the key (hi, prefix). Sets *a to the
    encrypted plain_lo, and returns nonzero if that equals cypher_lo; then
-   *b is the encrypted plain_hi. The reference for r72tt_scan() and the
-   SFPU, which only find candidates; this rechecks them. */
+   *b is the encrypted plain_hi. The reference for r72tt_scan(),
+   r72tt_scan_rvv() and the SFPU, which only find candidates; this rechecks
+   them. */
 static inline int rc5_72_check(const prefix_t *p, uint32_t hi,
                                uint32_t plain_lo, uint32_t plain_hi,
                                uint32_t cypher_lo, uint32_t *a, uint32_t *b)
@@ -170,14 +172,19 @@ static inline int rc5_72_check(const prefix_t *p, uint32_t hi,
 
 #include "r72tt_sfpu.h"
 
-static void run_scalar(volatile r72tt_mailbox_t *mb)
+/* Checks keys one at a time with r72tt_scan(). With 'rvv' (TRISC2 only),
+   whole blocks of 16 low key bytes go to r72tt_scan_rvv() instead; a block
+   it reports a candidate in is then scanned again by r72tt_scan(), as are
+   the keys before the first and after the last whole block. */
+static void run_scalar(volatile r72tt_mailbox_t *mb, int rvv)
 {
   uint32_t hi = mb->key_hi, mid = mb->key_mid, lo = mb->key_lo;
   const uint32_t count = mb->count;
   const uint32_t plain_lo = mb->plain_lo, plain_hi = mb->plain_hi;
   const uint32_t cypher_lo = mb->cypher_lo, cypher_hi = mb->cypher_hi;
+  const int verify = rvv && (mb->flags & R72TT_FLAG_VERIFY);
   uint32_t cmc_count = 0, cmc_index = 0, found = 0, errors = 0;
-  uint32_t n;
+  uint32_t n, rescan = 0, rescan_hit = 0, ea[16];
   uint64_t start = wall_clock(), cycles;
   scan_t ctx;
 
@@ -192,24 +199,64 @@ static void run_scalar(volatile r72tt_mailbox_t *mb)
     uint32_t run = 256 - hi, k;
     if (run > count - n)
       run = count - n;
-    k = r72tt_scan(&ctx, hi, run);
-    if (k < run)
+    if (rvv && !rescan && !(hi & 15) && run >= 16)
     {
-      uint32_t a, b;
-      if (rc5_72_check(&ctx.p, hi + k, plain_lo, plain_hi, cypher_lo, &a, &b))
+      run = verify ? 16 : run & ~15u;
+      k = r72tt_scan_rvv(&ctx, hi, run, ea);
+      if (verify)
       {
-        cmc_count++;
-        cmc_index = n + k;
-        if (b == cypher_hi)
+        uint32_t lane, a, b, hit = 0;
+        for (lane = 0; lane < 16; lane++)
         {
-          n += k;
-          found = 1;
-          break;
+          hit |= rc5_72_check(&ctx.p, hi + lane, plain_lo, plain_hi, cypher_lo, &a, &b);
+          if (ea[lane] != a)
+            errors++;
         }
+        if (hit != (k < run))
+          errors++;   /* a candidate missed, or reported without one */
       }
-      else
-        errors++;   /* r72tt_scan() and rc5_72_check() disagree */
-      k++;
+      if (k < run)
+      {
+        /* a candidate among the next 16 keys */
+        rescan = 16;
+        rescan_hit = 0;
+      }
+    }
+    else
+    {
+      if (rescan)
+      {
+        if (run > rescan)
+          run = rescan;
+      }
+      else if (rvv && run > 16 - (hi & 15))
+        run = 16 - (hi & 15);   /* up to the next whole block */
+      k = r72tt_scan(&ctx, hi, run);
+      if (k < run)
+      {
+        uint32_t a, b;
+        rescan_hit = 1;
+        if (rc5_72_check(&ctx.p, hi + k, plain_lo, plain_hi, cypher_lo, &a, &b))
+        {
+          cmc_count++;
+          cmc_index = n + k;
+          if (b == cypher_hi)
+          {
+            n += k;
+            found = 1;
+            break;
+          }
+        }
+        else
+          errors++;   /* r72tt_scan() and rc5_72_check() disagree */
+        k++;
+      }
+      if (rescan)
+      {
+        rescan -= k;
+        if (!rescan && !rescan_hit)
+          errors++;   /* r72tt_scan_rvv() and r72tt_scan() disagree */
+      }
     }
     n += k;
     hi += k;
@@ -363,7 +410,7 @@ void r72tt_main(uint32_t core)
     if (core == R72TT_CORE_TRISC1 && (mb->flags & R72TT_FLAG_SFPU))
       run_sfpu(mb);
     else
-      run_scalar(mb);
+      run_scalar(mb, core == R72TT_CORE_TRISC2 && (mb->flags & R72TT_FLAG_RVV));
     FENCE();
     mb->done_seq = done = seq;
   }
