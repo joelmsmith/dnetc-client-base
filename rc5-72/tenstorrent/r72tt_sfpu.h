@@ -26,6 +26,7 @@
  * Tensix instructions are the same every iteration, so they stay in TRISC1's
  * small instruction cache: their Dst accesses advance through the S[] slots
  * using the Dst read/write counter (RWC), via the address modes below.
+ * r72tt_sfpu_lm.h has a faster version of the batch for real devices.
  *
  * Dst slots of 32 values (four rows, even columns), at address 4 * slot + RWC:
  *   0..25  S[]       26..51  P + i*Q       52  ACC (match bits)
@@ -292,6 +293,9 @@ static void sfpu_setup(uint32_t plain_lo, uint32_t plain_hi, uint32_t cypher_lo)
   sfpu_clear_acc();
 }
 
+/* The SFPLOADMACRO version of sfpu_batch() */
+#include "r72tt_sfpu_lm.h"
+
 /* Stores a key schedule prefix for the batches that follow. Once per 256
    keys, so that each batch can load it with fixed instructions rather than
    TRISC1 encoding it into SFPLOADIs every time. */
@@ -301,6 +305,7 @@ static void sfpu_prefix(const prefix_t *p)
   TTI(SFPSTORE(LR_X, SLOT_PAB));
   sfpu_loadi32(LR_X, p->s0);
   TTI(SFPSTORE(LR_X, SLOT_PS(0)));
+  TTI(SFPSTORE(LR_X, SLOT_LM_S0));   /* where sfpu_batch_lm() loads it from */
   sfpu_loadi32(LR_X, p->s1);
   TTI(SFPSTORE(LR_X, SLOT_PS(1)));
   sfpu_loadi32(LR_X, p->s2);

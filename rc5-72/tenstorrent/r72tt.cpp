@@ -6,7 +6,8 @@
  * RC5-72 cores for Tenstorrent devices. All five RISC-V cores of every
  * Tensix tile run persistent firmware (r72tt_tile.c); with the SFPU cores,
  * TRISC1 drives the tile's Vector Unit instead of checking keys itself,
- * and with the RVV core TRISC2 also checks keys with its own vector unit.
+ * and with the RVV core TRISC2 also checks keys with its own vector unit
+ * and the Vector Unit is driven with SFPLOADMACRO.
  * Each call splits the keys into one contiguous range per core ("worker"),
  * sized by the worker's speed, and merges the per-worker results in key
  * order, so the outcome matches a sequential core exactly.
@@ -42,23 +43,26 @@ extern "C" const unsigned int r72tt_tile_fw_size;
 #define R72TT_MAX_WORKERS (TT_MAX_TILES * R72TT_CORES)
 
 /* Worker classes, and their initial speed estimates in clocks per key */
-#define CLASS_SCALAR 0
-#define CLASS_SFPU   1   /* TRISC1 driving the Vector Unit */
-#define CLASS_RVV    2   /* TRISC2 using its RISC-V vector unit */
-#define CLASSES      3
-static const double initial_clocks_per_key[CLASSES] = { 560.0, 35.0, 300.0 };
-static const u32 class_flags[CLASSES] = { 0, R72TT_FLAG_SFPU, R72TT_FLAG_RVV };
-static const char * const class_name[CLASSES] = { "RISC-V", "SFPU", "RVV" };
+#define CLASS_SCALAR  0
+#define CLASS_SFPU    1   /* TRISC1 driving the Vector Unit */
+#define CLASS_RVV     2   /* TRISC2 using its RISC-V vector unit */
+#define CLASS_SFPU_LM 3   /* CLASS_SFPU with SFPLOADMACRO */
+#define CLASSES       4
+static const double initial_clocks_per_key[CLASSES] = { 560.0, 35.0, 300.0, 32.0 };
+static const u32 class_flags[CLASSES] = { 0, R72TT_FLAG_SFPU, R72TT_FLAG_RVV,
+                                          R72TT_FLAG_SFPU | R72TT_FLAG_LOADMACRO };
+static const char * const class_name[CLASSES] = { "RISC-V", "SFPU", "RVV", "SFPU (SFPLOADMACRO)" };
 
-/* What the cores use besides the scalar code */
+/* What the cores use besides the scalar code. MODE_SFPU_RVV is for
+   hardware only, so its SFPU worker also uses SFPLOADMACRO. */
 #define MODE_RISCV     0
 #define MODE_SFPU      1
 #define MODE_SFPU_RVV  2
 
 static int mode_uses_class(int mode, int cls)
 {
-  return cls == CLASS_SCALAR || (cls == CLASS_SFPU && mode >= MODE_SFPU) ||
-         (cls == CLASS_RVV && mode == MODE_SFPU_RVV);
+  return cls == CLASS_SCALAR || (cls == CLASS_SFPU && mode == MODE_SFPU) ||
+         ((cls == CLASS_RVV || cls == CLASS_SFPU_LM) && mode == MODE_SFPU_RVV);
 }
 
 /* The class of RISC-V core 'core' of a tile */
@@ -66,6 +70,8 @@ static int worker_class(int mode, unsigned core)
 {
   if (core == R72TT_CORE_TRISC1 && mode_uses_class(mode, CLASS_SFPU))
     return CLASS_SFPU;
+  if (core == R72TT_CORE_TRISC1 && mode_uses_class(mode, CLASS_SFPU_LM))
+    return CLASS_SFPU_LM;
   if (core == R72TT_CORE_TRISC2 && mode_uses_class(mode, CLASS_RVV))
     return CLASS_RVV;
   return CLASS_SCALAR;
@@ -300,7 +306,7 @@ static int self_check(tt_device_t *dev, int devicenum, int cls, int verify)
   u32 *workers = device_state[devicenum].workers;
   const u32 count = 100, carry_at = 50;
   const unsigned n = cls != CLASS_SCALAR ? dev->tile_count : dev->tile_count * R72TT_CORES;
-  const unsigned core = cls == CLASS_SFPU ? R72TT_CORE_TRISC1 : R72TT_CORE_TRISC2;
+  const unsigned core = cls == CLASS_RVV ? R72TT_CORE_TRISC2 : R72TT_CORE_TRISC1;
   RC5_72UnitWork w;
   unsigned i, failed = 0;
   u32 seq = ++device_state[devicenum].seq;
@@ -380,7 +386,7 @@ static int run_keys(tt_device_t *dev, int devicenum, const RC5_72UnitWork *w, u3
   u32 *job_workers = ds->workers;
   const unsigned workers = dev->tile_count * R72TT_CORES;
   double weight[CLASSES], total_weight = 0, cumulative = 0;
-  ui64 class_keys[CLASSES] = { 0, 0, 0 }, class_cycles[CLASSES] = { 0, 0, 0 };
+  ui64 class_keys[CLASSES] = { 0, 0, 0, 0 }, class_cycles[CLASSES] = { 0, 0, 0, 0 };
   unsigned i, n = 0;
   u32 offset = 0, seq;
   si64 clocks;
@@ -480,7 +486,7 @@ static int run_keys(tt_device_t *dev, int devicenum, const RC5_72UnitWork *w, u3
     /* kept short: screen output is cut at 80 columns */
     Log("TT: %u keys, %u jobs, clk/key %.1f/%.1f/%.1f\n", count, n,
         ds->clocks_per_key[CLASS_SCALAR],
-        mode_uses_class(mode, CLASS_SFPU) ? ds->clocks_per_key[CLASS_SFPU] : 0.0,
+        mode == MODE_RISCV ? 0.0 : ds->clocks_per_key[worker_class(mode, R72TT_CORE_TRISC1)],
         mode_uses_class(mode, CLASS_RVV) ? ds->clocks_per_key[CLASS_RVV] : 0.0);
   }
   return found;

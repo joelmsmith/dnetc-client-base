@@ -68,9 +68,11 @@
        themselves. Much faster than #0.
     #2 "SFPU + RVV + RISC-V x3": as #1, and one of the four other RISC-V
        cores, the only one with the RISC-V vector extension, checks 16
-       keys at a time with it. This is the default and the fastest. It is
-       not available on the ttsim simulator, which does not have that
-       vector extension; core #1 is the default there.
+       keys at a time with it. The vector unit (SFPU) is also driven with
+       SFPLOADMACRO instructions, which let it do its loads and stores
+       alongside other work. This is the default and the fastest. It is
+       not available on the ttsim simulator, which has neither that
+       vector extension nor SFPLOADMACRO; core #1 is the default there.
 
   2.2   Running on the ttsim simulator ----------------------------------
 
@@ -119,6 +121,9 @@
 
     The firmware the client loads onto the device is built from
     rc5-72/tenstorrent/r72tt_tile.c, r72tt_scan.S and r72tt_scan_rvv.S.
+    (r72tt_sfpu_lm.h, the SFPLOADMACRO instruction stream of core #2, is
+    itself generated: tools/gen_sfpu_lm.py writes it after checking it
+    against a model of the instruction.)
     Its image is included in the source as
     rc5-72/tenstorrent/r72tt_tile_fw.cpp, so that building the client does
     not need a RISC-V compiler. After changing the firmware sources,

@@ -56,7 +56,9 @@ jobs:
         SHELL: /bin/sh
         SFPI_PATH: /tmp/sfpi
       run: ./configure linux-amd64-tenstorrent
+    - name: regenerate the SFPLOADMACRO stream
+      run: python3 rc5-72/tenstorrent/tools/gen_sfpu_lm.py > rc5-72/tenstorrent/r72tt_sfpu_lm.h
     - name: rebuild firmware
       run: make tt-firmware
     - name: compare
-      run: git diff --exit-code rc5-72/tenstorrent/r72tt_tile_fw.cpp
+      run: git diff --exit-code rc5-72/tenstorrent/r72tt_sfpu_lm.h rc5-72/tenstorrent/r72tt_tile_fw.cpp

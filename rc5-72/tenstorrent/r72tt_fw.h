@@ -34,16 +34,19 @@
 #define R72TT_ENTRY_STRIDE    16u
 
 #define R72TT_MAGIC_READY     0x52373254u   /* "R72T", written by firmware at boot */
-#define R72TT_ABI_VERSION     4u
+#define R72TT_ABI_VERSION     5u
 
 /* Mailbox flags. TRISC1 drives the Vector Unit (SFPU) when FLAG_SFPU is
    set, and TRISC2 uses its RISC-V vector unit when FLAG_RVV is set (other
-   cores ignore these). FLAG_VERIFY then additionally checks every key's
+   cores ignore these). FLAG_LOADMACRO selects the faster SFPU instruction
+   stream of r72tt_sfpu_lm.h, which simulators without SFPLOADMACRO cannot
+   run. FLAG_VERIFY then additionally checks every key's
    vector result against the scalar code, counting differences in
    verify_errors. */
 #define R72TT_FLAG_SFPU       1u
 #define R72TT_FLAG_VERIFY     2u
 #define R72TT_FLAG_RVV        4u
+#define R72TT_FLAG_LOADMACRO  8u   /* with FLAG_SFPU: the SFPLOADMACRO batch */
 
 typedef struct
 {

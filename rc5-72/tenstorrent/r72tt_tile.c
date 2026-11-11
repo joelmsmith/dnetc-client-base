@@ -294,6 +294,7 @@ static void run_sfpu(volatile r72tt_mailbox_t *mb)
   const uint32_t plain_lo = mb->plain_lo, plain_hi = mb->plain_hi;
   const uint32_t cypher_lo = mb->cypher_lo, cypher_hi = mb->cypher_hi;
   const int verify = (mb->flags & R72TT_FLAG_VERIFY) != 0;
+  const int lm = (mb->flags & R72TT_FLAG_LOADMACRO) != 0;
   const uint32_t first = hi & 31;
   const uint32_t batches = (first + count + 31) / 32;
   uint32_t cmc_count = 0, cmc_index = 0, found = 0, keys_done = count, errors = 0;
@@ -303,6 +304,8 @@ static void run_sfpu(volatile r72tt_mailbox_t *mb)
   prefix_t prefix;
 
   sfpu_setup(plain_lo, plain_hi, cypher_lo);
+  if (lm)
+    sfpu_lm_setup();
   key_prefix(mid, lo, &prefix);
   sfpu_prefix(&prefix);
   for (b = 0; b < batches && !found; b++)
@@ -311,7 +314,10 @@ static void run_sfpu(volatile r72tt_mailbox_t *mb)
     queued[pending].mid = mid;
     queued[pending].lo = lo;
     pending++;
-    sfpu_batch(base, verify);
+    if (lm)
+      sfpu_batch_lm(base, verify);
+    else
+      sfpu_batch(base, verify);
 
     if (verify)
     {
